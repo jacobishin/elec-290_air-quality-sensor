@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Air Quality Monitor</title>
+</head>
+<body>
+  <h1>Air Quality Monitor</h1>
+
+  <!-- Shown when logged out -->
+  <div id="login-section">
+    <input id="email" type="email" placeholder="Email">
+    <input id="password" type="password" placeholder="Password (6+ characters)">
+    <button id="register-btn">Register</button>
+    <button id="login-btn">Log in</button>
+    <p id="message"></p>
+  </div>
+
+  <!-- Shown when logged in -->
+  <div id="dashboard" style="display:none">
+    <p>Logged in as <span id="user-email"></span></p>
+    <button id="logout-btn">Log out</button>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import {
+      getAuth, createUserWithEmailAndPassword,
+      signInWithEmailAndPassword, signOut, onAuthStateChanged
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+    // PASTE YOUR firebaseConfig HERE
+    // Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyCInYadRTEuNcRaPqeYl7qe-p3b5zSzplI",
+  authDomain: "gas-monitor-6e3eb.firebaseapp.com",
+  projectId: "gas-monitor-6e3eb",
+  storageBucket: "gas-monitor-6e3eb.firebasestorage.app",
+  messagingSenderId: "1041203123160",
+  appId: "1:1041203123160:web:6a371b01318ea9ad9998ad"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+
+    const firebaseConfig = {
+      apiKey: "...",
+      authDomain: "...",
+      projectId: "...",
+      storageBucket: "...",
+      messagingSenderId: "...",
+      appId: "..."
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+
+    const message = document.getElementById("message");
+
+    document.getElementById("register-btn").onclick = async () => {
+      try {
+        await createUserWithEmailAndPassword(auth,
+          document.getElementById("email").value,
+          document.getElementById("password").value);
+      } catch (err) { message.textContent = err.message; }
+    };
+
+    document.getElementById("login-btn").onclick = async () => {
+      try {
+        await signInWithEmailAndPassword(auth,
+          document.getElementById("email").value,
+          document.getElementById("password").value);
+      } catch (err) { message.textContent = err.message; }
+    };
+
+    document.getElementById("logout-btn").onclick = () => signOut(auth);
+
+    // Runs whenever someone logs in or out
+    onAuthStateChanged(auth, (user) => {
+      document.getElementById("login-section").style.display = user ? "none" : "block";
+      document.getElementById("dashboard").style.display = user ? "block" : "none";
+      if (user) document.getElementById("user-email").textContent = user.email;
+    });
+  </script>
+</body>
+</html>
