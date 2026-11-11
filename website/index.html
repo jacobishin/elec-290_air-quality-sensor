@@ -1,41 +1,74 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Air Quality Monitor</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Quality Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  [hidden] { display: none !important; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 0 auto; padding: 16px; color: #1d2a2e; background: #f6f8f7; }
+  h1 { font-size: 1.5rem; margin: 0 0 12px; }
+  input, button { font: inherit; padding: 6px 10px; margin: 2px 0; }
+  button { cursor: pointer; }
+  nav { display: flex; gap: 8px; margin: 12px 0; }
+  nav button.active { background: #1d2a2e; color: #fff; }
+  .grade { display: inline-block; min-width: 2rem; text-align: center; padding: 2px 10px; border-radius: 4px; color: #fff; font-weight: 700; }
+  .gases { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 12px 0; }
+  .gas { background: #fff; border: 1px solid #cfd8d6; padding: 8px; }
+  .gas b { display: block; font-size: 1.2rem; }
+  .gas small { color: #52646a; }
+  table { border-collapse: collapse; width: 100%; background: #fff; font-size: .9rem; }
+  th, td { border: 1px solid #cfd8d6; padding: 5px 8px; text-align: left; }
+  .scroll { overflow-x: auto; }
+  #map { height: 380px; border: 1px solid #cfd8d6; margin: 8px 0; }
+  #message { color: #b00020; }
+</style>
 </head>
 <body>
-  <h1>Air Quality Monitor</h1>
+<h1>Air Quality Monitor</h1>
 
-  <!-- Shown when logged out -->
-  <div id="login-section">
-    <input id="email" type="email" placeholder="Email">
-    <input id="password" type="password" placeholder="Password (6+ characters)">
-    <button id="register-btn">Register</button>
-    <button id="login-btn">Log in</button>
-    <p id="message"></p>
-  </div>
+<!-- Logged out -->
+<div id="login-section">
+  <input id="device-id" placeholder="Device ID (e.g. monitor-01)">
+  <input id="password" type="password" placeholder="Password (6+ characters)">
+  <button id="login-btn">Log in</button>
+  <button id="register-btn">Register this device</button>
+  <p id="message"></p>
+</div>
 
-  <!-- Shown when logged in -->
-  <div id="dashboard" style="display:none">
-    <p>Logged in as <span id="user-email"></span></p>
-    <button id="logout-btn">Log out</button>
-  </div>
+<!-- Logged in -->
+<div id="app" hidden>
+  <p>Device: <b id="device-label"></b> <button id="logout-btn">Log out</button></p>
+  <nav>
+    <button id="tab-readings" class="active">Readings</button>
+    <button id="tab-map">Map</button>
+  </nav>
 
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-    import {
-      getAuth, createUserWithEmailAndPassword,
-      signInWithEmailAndPassword, signOut, onAuthStateChanged
-    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  <section id="view-readings">
+    <button id="add-test-btn">Add test reading</button>
+    <div id="latest"></div>
+    <h2>Recent readings</h2>
+    <div class="scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+  </section>
 
-    // PASTE YOUR firebaseConfig HERE
-    // Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+  <section id="view-map" hidden>
+    <p>Click the map to drop a pin, type the place name, then publish your latest reading. Published readings are visible to everyone.</p>
+    <div id="map"></div>
+    <input id="place" placeholder="Place name (e.g. Stauffer Library)">
+    <button id="publish-btn">Publish latest reading here</button>
+  </section>
+</div>
 
-// Your web app's Firebase configuration
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, doc, setDoc, addDoc, query, orderBy, limit, onSnapshot, Timestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+// PASTE YOUR firebaseConfig HERE
 const firebaseConfig = {
   apiKey: "AIzaSyCInYadRTEuNcRaPqeYl7qe-p3b5zSzplI",
   authDomain: "gas-monitor-6e3eb.firebaseapp.com",
@@ -45,47 +78,206 @@ const firebaseConfig = {
   appId: "1:1041203123160:web:6a371b01318ea9ad9998ad"
 };
 
-// Initialize Firebase
+
+// EDIT THIS LIST to match the gases your sensors measure.
+// "base" is only used to make fake test readings.
+const GASES = [
+  { key: "CO",   label: "Carbon monoxide",  unit: "ppm",   base: 1 },
+  { key: "CO2",  label: "Carbon dioxide",   unit: "ppm",   base: 420 },
+  { key: "NO2",  label: "Nitrogen dioxide", unit: "ppb",   base: 10 },
+  { key: "VOC",  label: "VOCs",             unit: "ppb",   base: 50 },
+  { key: "PM25", label: "PM2.5",            unit: "ug/m3", base: 8 }
+];
+const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", E: "#c62828" };
+
 const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const $ = (id) => document.getElementById(id);
 
-    const firebaseConfig = {
-      apiKey: "...",
-      authDomain: "...",
-      projectId: "...",
-      storageBucket: "...",
-      messagingSenderId: "...",
-      appId: "..."
-    };
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls;
+  return e;
+}
+function gradeBadge(g) {
+  const b = el("span", g || "?", "grade");
+  b.style.background = GRADE_COLORS[g] || "#777";
+  return b;
+}
+function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
+let deviceId = null, latest = null, unsub = null, registering = false;
+let map = null, pin = null, markers = null;
 
-    const message = document.getElementById("message");
+// ---------- Login: the device ID is the username ----------
+// Firebase logins need an email, so we turn the device ID into a fake one.
+const idToEmail = (id) => id + "@monitor.example";
 
-    document.getElementById("register-btn").onclick = async () => {
-      try {
-        await createUserWithEmailAndPassword(auth,
-          document.getElementById("email").value,
-          document.getElementById("password").value);
-      } catch (err) { message.textContent = err.message; }
-    };
+function readId() {
+  const id = $("device-id").value.trim().toLowerCase();
+  if (!/^[a-z0-9-]{3,30}$/.test(id)) {
+    $("message").textContent = "Device ID must be 3-30 letters, numbers or hyphens.";
+    return null;
+  }
+  return id;
+}
 
-    document.getElementById("login-btn").onclick = async () => {
-      try {
-        await signInWithEmailAndPassword(auth,
-          document.getElementById("email").value,
-          document.getElementById("password").value);
-      } catch (err) { message.textContent = err.message; }
-    };
+$("login-btn").onclick = async () => {
+  const id = readId(); if (!id) return;
+  try { await signInWithEmailAndPassword(auth, idToEmail(id), $("password").value); }
+  catch (e) { $("message").textContent = "Login failed: " + e.message; }
+};
 
-    document.getElementById("logout-btn").onclick = () => signOut(auth);
+$("register-btn").onclick = async () => {
+  const id = readId(); if (!id) return;
+  registering = true;
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, idToEmail(id), $("password").value);
+    await setDoc(doc(db, "devices", id), { ownerUid: cred.user.uid });
+    registering = false;
+    showApp(cred.user);
+  } catch (e) {
+    registering = false;
+    $("message").textContent = e.code === "auth/email-already-in-use"
+      ? "That device ID is already registered. Log in instead." : e.message;
+  }
+};
 
-    // Runs whenever someone logs in or out
-    onAuthStateChanged(auth, (user) => {
-      document.getElementById("login-section").style.display = user ? "none" : "block";
-      document.getElementById("dashboard").style.display = user ? "block" : "none";
-      if (user) document.getElementById("user-email").textContent = user.email;
+$("logout-btn").onclick = () => signOut(auth);
+
+onAuthStateChanged(auth, (user) => {
+  if (registering) return;
+  user ? showApp(user) : showLogin();
+});
+
+function showLogin() {
+  if (unsub) { unsub(); unsub = null; }
+  latest = null;
+  $("login-section").hidden = false;
+  $("app").hidden = true;
+}
+
+function showApp(user) {
+  deviceId = user.email.split("@")[0];
+  $("device-label").textContent = deviceId;
+  $("login-section").hidden = true;
+  $("app").hidden = false;
+  $("message").textContent = "";
+  if (unsub) unsub();
+  // Readings live under the device: devices/<id>/readings
+  const q = query(collection(db, "devices", deviceId, "readings"), orderBy("timestamp", "desc"), limit(10));
+  unsub = onSnapshot(q, (snap) => {
+    const rows = snap.docs.map((d) => d.data());
+    latest = rows[0] || null;
+    renderLatest();
+    renderTable(rows);
+  }, (err) => alert("Could not read: " + err.message));
+}
+
+// ---------- Readings tab ----------
+function renderLatest() {
+  const box = $("latest");
+  box.replaceChildren();
+  if (!latest) { box.append(el("p", "No readings yet. Click Add test reading.")); return; }
+  const head = el("p", "Latest reading, taken " + fmtTime(latest.timestamp) + "  ");
+  head.append(gradeBadge(latest.grade));
+  box.append(head);
+  const grid = el("div", undefined, "gases");
+  GASES.forEach((g) => {
+    const r = (latest.gases || {})[g.key];
+    if (!r) return;
+    const card = el("div", undefined, "gas");
+    card.append(el("span", g.label), el("b", r.value + " " + g.unit));
+    card.append(el("small", "baseline " + r.baseline + " (" + (r.value / r.baseline).toFixed(1) + "x)"));
+    grid.append(card);
+  });
+  box.append(grid);
+}
+
+function renderTable(rows) {
+  const head = $("table-head"), body = $("table-body");
+  head.replaceChildren(); body.replaceChildren();
+  const hr = el("tr");
+  ["Device time", "Grade", ...GASES.map((g) => g.key + " (" + g.unit + ")")].forEach((t) => hr.append(el("th", t)));
+  head.append(hr);
+  rows.forEach((r) => {
+    const tr = el("tr");
+    tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade));
+    GASES.forEach((g) => tr.append(el("td", (r.gases && r.gases[g.key]) ? r.gases[g.key].value : "")));
+    body.append(tr);
+  });
+}
+
+// Fake reading. The timestamp stands in for the time the DEVICE took the reading.
+$("add-test-btn").onclick = async () => {
+  const gases = {};
+  GASES.forEach((g) => {
+    gases[g.key] = { value: +(g.base * (0.5 + Math.random() * 3)).toFixed(2), baseline: g.base };
+  });
+  const grade = "ABCDE"[Math.floor(Math.random() * 5)];
+  try {
+    await addDoc(collection(db, "devices", deviceId, "readings"),
+      { timestamp: Timestamp.fromDate(new Date()), grade, gases });
+  } catch (e) { alert("Could not save: " + e.message); }
+};
+
+// ---------- Tabs ----------
+function openTab(name) {
+  $("view-readings").hidden = name !== "readings";
+  $("view-map").hidden = name !== "map";
+  $("tab-readings").classList.toggle("active", name === "readings");
+  $("tab-map").classList.toggle("active", name === "map");
+  if (name === "map") initMap();
+}
+$("tab-readings").onclick = () => openTab("readings");
+$("tab-map").onclick = () => openTab("map");
+
+// ---------- Map tab (public) ----------
+function popupFor(r) {
+  const d = el("div");
+  d.append(el("b", r.place), el("br"), gradeBadge(r.grade), el("br"), el("small", fmtTime(r.timestamp)));
+  GASES.forEach((g) => {
+    const v = r.gases && r.gases[g.key];
+    if (v) d.append(el("br"), el("span", g.key + ": " + v.value + " " + g.unit + " (baseline " + v.baseline + ")"));
+  });
+  return d;
+}
+
+function initMap() {
+  if (map) { map.invalidateSize(); return; }
+  map = L.map("map").setView([44.2253, -76.4951], 12);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
+  markers = L.layerGroup().addTo(map);
+  map.on("click", (e) => {
+    if (pin) pin.setLatLng(e.latlng);
+    else pin = L.circleMarker(e.latlng, { radius: 8, color: "#000", weight: 3, fill: false }).addTo(map);
+  });
+  const q = query(collection(db, "publicReadings"), orderBy("timestamp", "desc"), limit(200));
+  onSnapshot(q, (snap) => {
+    markers.clearLayers();
+    snap.forEach((d) => {
+      const r = d.data();
+      L.circleMarker([r.lat, r.lng], { radius: 9, color: GRADE_COLORS[r.grade] || "#555", fillOpacity: 0.8 })
+        .bindPopup(popupFor(r)).addTo(markers);
     });
-  </script>
+  }, (err) => alert("Could not load map data: " + err.message));
+}
+
+$("publish-btn").onclick = async () => {
+  const place = $("place").value.trim();
+  if (!latest) return alert("You need a reading first.");
+  if (!pin || !place) return alert("Click the map to drop a pin and type a place name.");
+  const ll = pin.getLatLng();
+  try {
+    // No device ID or account info is copied, so the public data is anonymous.
+    await addDoc(collection(db, "publicReadings"),
+      { place, lat: ll.lat, lng: ll.lng, grade: latest.grade, gases: latest.gases, timestamp: latest.timestamp });
+    $("place").value = "";
+  } catch (e) { alert("Could not publish: " + e.message); }
+};
+</script>
 </body>
 </html>
