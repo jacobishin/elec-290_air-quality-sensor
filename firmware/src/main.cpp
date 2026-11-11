@@ -1,18 +1,54 @@
 #include <Arduino.h>
+#include <math.h>
+#include <WiFi.h>
 
-// put function declarations here:
-int myFunction(int, int);
+/* CONFIGURATION */
+// add constants here
 
-void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
-}
 
+/* DATA STRUCTURES */
+
+
+/* GLOBAL VARIABLES */
+
+
+/* FUNCTION DECLARATIONS */
+// Initialization
+
+
+// Data acquisition
+
+
+// Data processing & fault detection
+
+
+// Decision logic
+
+
+// Communication
+
+
+// Data Storage
+
+
+/* MAIN LOOP */
 void loop() {
-  // put your main code here, to run repeatedly:
+
 }
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
-}
+/* INITIALIZATION*/
+
+
+/* DATA ACQUISITION */
+
+
+/* DATA PROCESSING & FAULT DETECTION */
+
+
+/* DECISION LOGIC */
+
+
+/* COMMUNICATION */
+
+
+/* DATA STORAGE */

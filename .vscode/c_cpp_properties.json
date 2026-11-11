@@ -8,8 +8,8 @@
         {
             "name": "PlatformIO",
             "includePath": [
-                "/Users/jacobshin/Documents/learning/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/include",
-                "/Users/jacobshin/Documents/learning/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/src",
+                "/Users/jacobshin/Library/Mobile Documents/com~apple~CloudDocs/main/education/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/include",
+                "/Users/jacobshin/Library/Mobile Documents/com~apple~CloudDocs/main/education/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/src",
                 "/Users/jacobshin/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                 "/Users/jacobshin/.platformio/packages/framework-arduinoespressif32-esp32-libs/dio_qspi/include",
                 "/Users/jacobshin/.platformio/packages/framework-arduinoespressif32-esp32-libs/include/newlib/platform_include",
@@ -373,8 +373,8 @@
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
-                    "/Users/jacobshin/Documents/learning/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/include",
-                    "/Users/jacobshin/Documents/learning/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/src",
+                    "/Users/jacobshin/Library/Mobile Documents/com~apple~CloudDocs/main/education/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/include",
+                    "/Users/jacobshin/Library/Mobile Documents/com~apple~CloudDocs/main/education/undergraduate/courses/elec-290/main-project/elec-290_air-quality-sensor/firmware/src",
                     "/Users/jacobshin/.platformio/packages/framework-arduinoespressif32/cores/esp32",
                     "/Users/jacobshin/.platformio/packages/framework-arduinoespressif32-esp32-libs/dio_qspi/include",
                     "/Users/jacobshin/.platformio/packages/framework-arduinoespressif32-esp32-libs/include/newlib/platform_include",
