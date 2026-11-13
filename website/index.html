@@ -68,7 +68,7 @@ import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, si
 import { getFirestore, collection, doc, setDoc, addDoc, query, orderBy, limit, onSnapshot, Timestamp }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-// PASTE YOUR firebaseConfig HERE
+
 const firebaseConfig = {
   apiKey: "AIzaSyCInYadRTEuNcRaPqeYl7qe-p3b5zSzplI",
   authDomain: "gas-monitor-6e3eb.firebaseapp.com",
@@ -79,16 +79,13 @@ const firebaseConfig = {
 };
 
 
-// EDIT THIS LIST to match the gases your sensors measure.
-// "base" is only used to make fake test readings.
 const GASES = [
   { key: "CO",   label: "Carbon monoxide",  unit: "ppm",   base: 1 },
   { key: "CO2",  label: "Carbon dioxide",   unit: "ppm",   base: 420 },
-  { key: "NO2",  label: "Nitrogen dioxide", unit: "ppb",   base: 10 },
   { key: "VOC",  label: "VOCs",             unit: "ppb",   base: 50 },
   { key: "PM25", label: "PM2.5",            unit: "ug/m3", base: 8 }
 ];
-const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", E: "#c62828" };
+const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", F: "#c62828" };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -111,8 +108,6 @@ function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 let deviceId = null, latest = null, unsub = null, registering = false;
 let map = null, pin = null, markers = null;
 
-// ---------- Login: the device ID is the username ----------
-// Firebase logins need an email, so we turn the device ID into a fake one.
 const idToEmail = (id) => id + "@monitor.example";
 
 function readId() {
@@ -176,7 +171,7 @@ function showApp(user) {
   }, (err) => alert("Could not read: " + err.message));
 }
 
-// ---------- Readings tab ----------
+// Readings tab 
 function renderLatest() {
   const box = $("latest");
   box.replaceChildren();
@@ -223,7 +218,7 @@ $("add-test-btn").onclick = async () => {
   } catch (e) { alert("Could not save: " + e.message); }
 };
 
-// ---------- Tabs ----------
+// Tabs
 function openTab(name) {
   $("view-readings").hidden = name !== "readings";
   $("view-map").hidden = name !== "map";
@@ -234,7 +229,7 @@ function openTab(name) {
 $("tab-readings").onclick = () => openTab("readings");
 $("tab-map").onclick = () => openTab("map");
 
-// ---------- Map tab (public) ----------
+// Map tab (public)
 function popupFor(r) {
   const d = el("div");
   d.append(el("b", r.place), el("br"), gradeBadge(r.grade), el("br"), el("small", fmtTime(r.timestamp)));
