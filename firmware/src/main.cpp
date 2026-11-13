@@ -69,12 +69,25 @@ const char* LOG_FILE_1_PATH    = "/sensor_log_1.csv";
 const char* LOG_FILE_2_PATH    = "/sensor_log_2.csv";
 const size_t MAX_LOG_FILE_SIZE = 100000;
 
+const char* CSV_HEADER = "timestamp_ms,alert_active,"
+                         "co_avg,co_max,co_count,co_valid,"
+                         "tvoc_avg,tvoc_max,tvoc_count,tvoc_valid,"
+                         "eco2_avg,eco2_max,eco2_count,eco2_valid,"
+                         "temp_avg,temp_max,temp_count,temp_valid,"
+                         "hum_avg,hum_max,hum_count,hum_valid,"
+                         "pm25_avg,pm25_max,pm25_count,pm25_valid";
+
 
 // Air quality thresholds
-const float C0_THRESHOLD_PPM = NULL;
-const float TVOC_THRESHOLD_PPB = NULL;
-const float ECO2_THRESHOLD_PPM = NULL;
-const float PM25_THRESHOLD_UGM3 = NULL;
+const float C0_THRESHOLD1_PPM = NULL;
+const float TVOC_THRESHOLD1_PPB = NULL;
+const float ECO2_THRESHOLD1_PPM = NULL;
+const float PM25_THRESHOLD1_UGM3 = NULL;
+
+const float C0_THRESHOLD2_PPM = NULL;
+const float TVOC_THRESHOLD2_PPB = NULL;
+const float ECO2_THRESHOLD2_PPM = NULL;
+const float PM25_THRESHOLD2_UGM3 = NULL;
 
 
 // ============================================================
@@ -115,7 +128,7 @@ struct RawSensorData {
   PM25Data pm25;
 };
 
-// Running total during 60s window
+// Running total during 60s and 5s window
 struct SensorTotal {
   float sum = 0.0f;
   float maximum = -INFINITY;
@@ -132,7 +145,7 @@ struct SensorAccumulators {
 };
 
 // Processed data structs
-// Finalized 60-second window summary for CSV storage & Firebase
+// Finalized 60-second and 5-second window
 struct AverageData {
   float average = NAN;
   float maximum = NAN;
@@ -162,6 +175,39 @@ struct FaultStatus {
 /* GLOBAL VARIABLES */
 // ============================================================
 
+RawSensorData rawData = {};
+
+SensorAccumulators safetyAccumulators = {}; // Running 5-second accumulators
+ProcessedData displayData = {};             // Finalized 5-second trimmed-mean data (LCD & Buzzer)
+
+SensorAccumulators accumulators = {};       // Running 60-second accumulators
+ProcessedData loggedData = {};              // Finalized 60-second average & peak data (CSV & Firebase)
+
+FaultStatus faults = {};
+
+bool wifiConnected        = false;
+bool dangerAlertActive    = false;
+String activeAlertMessage = "Normal";
+
+// Hardware instances
+Adafruit_SGP30 sgp;
+DHT dht(DHT_PIN, DHT11);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// byte offset for last cloud upload in csv file
+Preferences syncPrefs;
+uint8_t activeLogFileIndex    = 1;
+size_t lastUploadedByteOffset = 0;
+
+// Non-blocking timers
+unsigned long lastMQ7Read      = 0;
+unsigned long lastSGP30Read    = 0;
+unsigned long lastTempHumRead  = 0;
+unsigned long lastPM25Read     = 0;
+unsigned long lastDisplayAndUI = 0;
+unsigned long lastWindowClose  = 0;
+unsigned long lastTransmission = 0;
+
 
 // ============================================================
 /* FUNCTION DECLARATIONS */
@@ -187,6 +233,13 @@ struct FaultStatus {
 
 
 // Data Storage
+
+
+// ============================================================
+/* SETUP */
+// ============================================================
+
+
 
 // ============================================================
 /* MAIN LOOP */
