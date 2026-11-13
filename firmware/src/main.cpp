@@ -198,7 +198,6 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 Preferences syncPrefs;
 uint8_t activeLogFileIndex    = 1;
 size_t lastUploadedByteOffset = 0;
-uint32_t currentBootId        = 1;
 bool timeSyncedThisBoot       = false;
 unsigned long bootEpochSec    = 0;
 
@@ -236,16 +235,18 @@ void acquirePM25(unsigned long currentTime);
 
 // the general idea is that the sensors will take an average reading every 5 seconds and display it, 
 // then take the average of 60 seconds and save and upload it every 60 seconds. each sensor has 
-// its own sampling interval. for the average readings every 5 seconds, it should remove the highest and lowest reading, then take the average of whats left
+// its own sampling interval. for the average readings every 5 seconds, 
+// it should remove the highest and lowest reading, then take the average of whats left
 
 
 // Decision logic
 
 
-// Communication
-
-
 // Data Storage
+getActiveLogFilePath()
+
+
+// Communication
 
 
 // ============================================================
@@ -288,6 +289,68 @@ void initializeSystem() {
   Serial.println("Initialization complete."); // for debug purposes
 }
 
+void initializeSensors(){}
+void initializeDisplay(){}
+
+void initializeStorage(){
+  Serial.println("Initializing storage..."); // for debug purposes
+  if (!LittleFS.begin(true)) {
+    Serial.println("ERROR: LittleFS mount failed!");
+    faults.storageFault = true;
+    return;
+  }
+
+  syncPrefs.begin("gas_sync", false);
+
+  activeLogFileIndex = syncPrefs.getUChar("active_file", 1);
+  if (activeLogFileIndex != 1 && activeLogFileIndex != 2) {
+    activeLogFileIndex = 1;
+    syncPrefs.putUChar("active_file", 1);
+  }
+  lastUploadedByteOffset = syncPrefs.getUInt("upload_offset", 0);
+
+  const char* activePath = getActiveLogFilePath();
+
+  if (!LittleFS.exists(activePath)) {
+    File logFile = LittleFS.open(activePath, "w");
+    if (logFile) {
+      logFile.println(CSV_HEADER);
+      lastUploadedByteOffset = logFile.size(); // Skip header row
+      logFile.close();
+      syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+      Serial.printf("Created %s and set offset past header.\n", activePath);
+    } else {
+      faults.storageFault = true;
+      return;
+    }
+  } else {
+    File logFile = LittleFS.open(activePath, "r");
+    if (logFile) {
+      size_t currentSize = logFile.size();
+      logFile.close();
+      if (lastUploadedByteOffset > currentSize) {
+        lastUploadedByteOffset = 0;
+        syncPrefs.putUInt("upload_offset", 0);
+      }
+    }
+  }
+
+  faults.storageFault = false;
+}
+
+void initializeCommunication(){
+  Serial.println("Initializing communication...");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true); // automatically set the modem to sleep to conserve battery life
+  WiFi.setAutoReconnect(true); // make wi-fi auto reconnect if it drops off
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  // Configure background NTP time synchronization (UTC / Unix Epoch)
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+void initializeAlerts(){}
+
 
 // ============================================================
 /* DATA ACQUISITION */
@@ -319,11 +382,41 @@ int faultDetections(struct FaultStatus* listOfFaults){
 /* DECISION LOGIC */
 // ============================================================
 
-// ============================================================
-/* COMMUNICATION */
-// ============================================================
 
 // ============================================================
-/* DATA STORAGE */
+// 5. DATA STORAGE
 // ============================================================
+// the general idea for data storage is that the esp32 saves the 60-second 
+// average readings directly onto its internal flash memory (LittleFS) so no 
+// data is lost if the power cuts out or the wi-fi drops. to keep the flash 
+// memory from filling up, it alternates between two 100 KB csv files. before 
+// writing a new row, it checks if the current file is full, and if it is, it 
+// wipes the other file, writes the csv headers, and switches over to logging there.
+//
+// it also keeps track of which file is active and the exact byte position of the 
+// last row uploaded to firebase using NVS preferences, so it knows where to pick 
+// back up after a reboot. while the device is offline, it just logs the time in 
+// seconds since boot, then once wi-fi connects and gets the real time from NTP, 
+// it goes back through the active csv file and updates those boot timestamps to 
+// real unix timestamps. there are also serial commands ('D' and 'R') so you can 
+// dump the active csv file to the serial monitor or wipe the logs to reset everything.
+
+// ============================================================
+// 6. COMMUNICATION
+// ============================================================
+// the communication section handles everything to do with sending information to 
+// the user and the cloud, so this includes updating the lcd, managing the wi-fi 
+// connection, uploading logs to firebase, and printing debug info to the serial 
+// monitor. every 5 seconds, it checks the wi-fi status and refreshes the lcd to 
+// show whether wi-fi is connected or disconnected, any active gas alerts or sensor 
+// faults, and the 5-second trimmed averages for CO and TVOC.
+//
+// instead of sending live sensor readings straight to the cloud, it reads unsent 
+// rows directly from the local csv file every 2 seconds when wi-fi is connected. 
+// it converts each csv row into a json format (turning any NAN values into null) 
+// and sends it to firebase, only moving the saved upload bookmark forward once 
+// firebase confirms it received the data. wi-fi modem-sleep and auto-reconnect are 
+// also turned on here to help save battery life.
+
+
 
