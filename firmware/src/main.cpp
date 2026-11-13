@@ -243,7 +243,7 @@ void acquirePM25(unsigned long currentTime);
 
 
 // Data Storage
-getActiveLogFilePath()
+const char getActiveLogFilePath();
 
 
 // Communication
