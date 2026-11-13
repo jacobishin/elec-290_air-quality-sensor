@@ -13,6 +13,7 @@ LCD
 
 #include <Arduino.h>
 #include <math.h>
+#include <time.h>
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -197,6 +198,9 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 Preferences syncPrefs;
 uint8_t activeLogFileIndex    = 1;
 size_t lastUploadedByteOffset = 0;
+uint32_t currentBootId        = 1;
+bool timeSyncedThisBoot       = false;
+unsigned long bootEpochSec    = 0;
 
 // Non-blocking timers
 unsigned long lastMQ7Read      = 0;
@@ -213,9 +217,19 @@ unsigned long lastTransmission = 0;
 // ============================================================
 
 // Initialization
-
+void initializeSystem();
+void initializeSensors();
+void initializeDisplay();
+void initializeStorage();
+void initializeCommunication();
+void initializeAlerts();
 
 // Data acquisition
+void readSensors(unsigned long currentTime);
+void acquireMQ7(unsigned long currentTime);
+void acquireSGP30(unsigned long currentTime);
+void acquireTempHumidity(unsigned long currentTime);
+void acquirePM25(unsigned long currentTime);
 
 
 // Data processing & fault detection
@@ -238,7 +252,11 @@ unsigned long lastTransmission = 0;
 /* SETUP */
 // ============================================================
 
-
+void setup() {
+  Serial.begin(115200);
+  initializeSystem();
+  Serial.println("Harmful Gas Monitor Started\n");
+}
 
 // ============================================================
 /* MAIN LOOP */
@@ -259,6 +277,17 @@ void loop() {
 // ============================================================
 /* INITIALIZATION*/
 // ============================================================
+
+void initializeSystem() {
+  Serial.println("Initializing system..."); // for debug purposes
+  initializeAlerts();
+  initializeSensors();
+  initializeDisplay();
+  initializeStorage();
+  initializeCommunication();
+  Serial.println("Initialization complete."); // for debug purposes
+}
+
 
 // ============================================================
 /* DATA ACQUISITION */
