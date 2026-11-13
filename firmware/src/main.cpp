@@ -76,7 +76,6 @@ const float TVOC_THRESHOLD_PPB = NULL;
 const float ECO2_THRESHOLD_PPM = NULL;
 const float PM25_THRESHOLD_UGM3 = NULL;
 
-
 // ============================================================
 /* DATA STRUCTURES */
 // ============================================================
@@ -215,7 +214,25 @@ void loop() {
 // ============================================================
 /* DATA PROCESSING & FAULT DETECTION */
 // ============================================================
+int processData(struct SensorAccumulators){
+  //compare sensor readings to threshold values 
 
+
+  //return enum error report if error occuring
+}
+
+int faultDetections(struct FaultStatus* listOfFaults){
+  /*
+    if faults are detected:
+    listOfFaults->sensorFault = true;
+    listOfFaults->invalidReading = true;
+    listOfFaults-> staleReading = true;
+    listOfFaults-> storageFault = false;
+    listOfFaults->wifiFault = false;
+
+    
+  */
+}
 // ============================================================
 /* DECISION LOGIC */
 // ============================================================
