@@ -309,7 +309,7 @@ void initializeStorage(){
   }
   lastUploadedByteOffset = syncPrefs.getUInt("upload_offset", 0);
 
-  const char* activePath = getActiveLogFilePath();
+  // const char* activePath = getActiveLogFilePath();
 
   if (!LittleFS.exists(activePath)) {
     File logFile = LittleFS.open(activePath, "w");
