@@ -3,10 +3,10 @@ ELEC 290 Section 002-01- Harmful gas sensor firmware
 
 Hardware:
 ESP32-WROVER
-SGP30
-MQ-7
-DHT11
-PMS7003
+SGP30 - eCO2 and TVOC sensor
+MQ-7 - CO sensor
+DHT11 - temp and humid sensor
+PMS7003 - pm2.5 sensor
 Buzzer
 LCD
 */
@@ -27,6 +27,7 @@ LCD
 #include <DHT.h>
 #include <LiquidCrystal_I2C.h> // not sure if this is the right library
 
+
 // ============================================================
 /* CONFIGURATION */
 // ============================================================
@@ -45,8 +46,12 @@ const int I2C_SCL_PIN = NULL;
 const int PMS_RX_PIN = NULL;
 const int PMS_TX_PIN = NULL;
 
+//sensor pins
 const int MQ7_PIN  = NULL;
 const int DHT_PIN = NULL;
+const int SGP30_PIN = NULL;
+const int PM25_PIN = NULL;
+
 const int BUZZER_PIN = NULL;
 
 // Sensor sampling intervals
@@ -89,6 +94,12 @@ const float C0_THRESHOLD2_PPM = NULL;
 const float TVOC_THRESHOLD2_PPB = NULL;
 const float ECO2_THRESHOLD2_PPM = NULL;
 const float PM25_THRESHOLD2_UGM3 = NULL;
+
+const int allowedSensorFaults = NULL;
+const int allowedInvalidReadings = NULL;
+const int allowedStaleReadings = NULL;
+const int allowedStorageFaults = NULL;
+const int allowedWifiFaults = NULL;
 
 // ============================================================
 /* DATA STRUCTURES */
@@ -135,6 +146,7 @@ struct SensorTotal {
   unsigned int count = 0;
 };
 
+// Contains SensorTotal structs for each read in value (raw data), wrapped in a SensorAccumulator struct
 struct SensorAccumulators {
   SensorTotal coPPM;
   SensorTotal tvocPPB;
@@ -164,11 +176,36 @@ struct ProcessedData {
 };
 
 struct FaultStatus {
-  bool sensorFault    = false;
-  bool invalidReading = false;
-  bool staleReading   = false;
-  bool storageFault   = false;
-  bool wifiFault      = false;
+  struct SensorFault sensor;
+  struct InvalidReading readingInvalid;
+  struct StaleReading readingStale;
+  struct StorageFault storage;
+  struct WifiFault wifi;
+};
+
+struct SensorFault {
+  bool status = false;
+  int num = 0;
+};
+
+struct InvalidReading {
+  bool status = false;
+  int num = 0;
+};
+
+struct StaleReading {
+  bool status = false;
+  int num = 0;
+};
+
+struct StorageFault {
+  bool status = false;
+  int num = 0;
+};
+
+struct WifiFault {
+  bool status = false;
+  int num = 0;
 };
 
 // ============================================================
@@ -191,7 +228,7 @@ String activeAlertMessage = "Normal";
 
 // Hardware instances
 Adafruit_SGP30 sgp;
-DHT dht(DHT_PIN, DHT11);
+DHT dht(DHT_PIN, DHT22);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // byte offset for last cloud upload in csv file
@@ -296,7 +333,8 @@ void initializeStorage(){
   Serial.println("Initializing storage..."); // for debug purposes
   if (!LittleFS.begin(true)) {
     Serial.println("ERROR: LittleFS mount failed!");
-    faults.storageFault = true;
+    faults.storage.num++;
+    //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
     return;
   }
 
@@ -320,7 +358,8 @@ void initializeStorage(){
       syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
       Serial.printf("Created %s and set offset past header.\n", activePath);
     } else {
-      faults.storageFault = true;
+      faults.storage.num++;
+      //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
       return;
     }
   } else {
@@ -335,7 +374,8 @@ void initializeStorage(){
     }
   }
 
-  faults.storageFault = false;
+  faults.storage.num++;
+  //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
 }
 
 void initializeCommunication(){
@@ -356,27 +396,129 @@ void initializeAlerts(){}
 /* DATA ACQUISITION */
 // ============================================================
 
+/// @brief sensors are read into the rawData struct, and then fed into accumulateData()
+///        to obtain an average for the raw data. 
+/// @param rawData 
+void readSensors(){
+  //rawSensorData struct containing individual sensor data, which is updated every sensor read
+  //sensorAccumulator struct which that raw data is added in sum, and count++ to later be used
+  //in data processing
+  
+  //read in all data
+  try {
+    rawData.mq7.coPPM.value = analogRead(MQ7_PIN);
+    
+
+    if (!sgp.IAQmeasure()){ //IAQmeasure return value is a bool
+      throw ("SGP30 reading returned false");
+    }
+    rawData.sgp30.eco2PPM.value = sgp.eCO2; //i think this is in ppm
+    rawData.sgp30.tvocPPB.value = sgp.TVOC; //i think this is in ppb
+    
+    float tempHumid = dht.readHumidity(); //in % - water vapor in air as a percent of max the air can hold at temp
+    float tempTemper = dht.readTemperature(); //in degree C
+    if (isnan(tempHumid)){
+      throw ("Humidity sensor nan");
+    }
+    
+    rawData.tempHum.humidityPercent.value = tempHumid;
+    rawData.tempHum.temperatureC.value = tempTemper;
+    if (isnan(tempTemper)){
+      throw ("Temperature sensor nan");
+    }
+    
+
+  }
+  catch (const char* msg){
+    //!!!!!!!!!!!!!!!!!this should later do something with fault management
+    Serial.print(msg);
+  } 
+
+
+  
+}
+
+void accumulateData(){
+  
+}
 // ============================================================
 /* DATA PROCESSING & FAULT DETECTION */
 // ============================================================
-int processData(struct SensorAccumulators){
-  //compare sensor readings to threshold values 
 
+//!!Copy and pasted here so I don't have to scroll all the way back up 
+/*struct SensorTotal {
+  float sum = 0.0f;
+  float maximum = -INFINITY;
+  unsigned int count = 0;
+};
+struct SensorAccumulators {
+  SensorTotal coPPM;
+  SensorTotal tvocPPB;
+  SensorTotal eco2PPM;
+  SensorTotal temperatureC;
+  SensorTotal humidityPercent;
+  SensorTotal pm25UGM3;
+};
+struct AverageData {
+  float average = NAN;
+  float maximum = NAN;
+  unsigned int sampleCount = 0;
+  bool valid = false;
+};
+struct ProcessedData {
+  unsigned long windowEndTimestamp = 0;
+  AverageData coPPM;
+  AverageData tvocPPB;
+  AverageData eco2PPM;
+  AverageData temperatureC;
+  AverageData humidityPercent;
+  AverageData pm25UGM3;
+};*/
+
+//I don't want the original struct to be able to be altered, since it contains the raw data, so
+//it is not going to be a pointer
+int processData(){
+  //average values out based on what is in each struct and add it to new structs that average the total
+
+  struct ProcessedData processed;
+
+  processed.coPPM;
+
+  //compare sensor readings to threshold values 
 
   //return enum error report if error occuring
 }
 
-int faultDetections(struct FaultStatus* listOfFaults){
+int faultDetections(){
   /*
+    For faults: store an amount of faults during the given frame before uploading data, and if that 
+    frame contains a set number of errors, then cause a fault to occur.
     if faults are detected:
     listOfFaults->sensorFault = true;
     listOfFaults->invalidReading = true;
     listOfFaults-> staleReading = true;
     listOfFaults-> storageFault = false;
     listOfFaults->wifiFault = false;
-
-    
   */
+  if (faults.sensor.num >= allowedSensorFaults){
+    //do smthn
+  }
+
+  if (faults.readingInvalid.num >= allowedInvalidReadings){
+    //do smthn
+  }
+
+  if (faults.readingStale.num >= allowedInvalidReadings){
+    //do smthn
+  }
+
+  if (faults.storage.num >= allowedInvalidReadings){
+    //do smthn
+  }
+
+  if (faults.wifi.num >= allowedWifiFaults){
+    //do smthn
+  }
 }
 // ============================================================
 /* DECISION LOGIC */
