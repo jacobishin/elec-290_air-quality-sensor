@@ -439,8 +439,85 @@ void readSensors(){
 }
 
 void accumulateData(){
-  
+  //safetyAccumulators is for 5 second display update
+  //accumulators is for 60 second file write
+  float readInData = rawData.mq7.coPPM.value;
+
+  safetyAccumulators.coPPM.sum += readInData;
+  accumulators.coPPM.sum += readInData;
+  if (isMax(readInData, safetyAccumulators.coPPM.sum)){
+    safetyAccumulators.coPPM.maximum = readInData;
+  }
+  if (isMax(readInData, accumulators.coPPM.sum)){
+    accumulators.coPPM.maximum = readInData;
+  }
+
+  readInData = rawData.sgp30.eco2PPM.value;
+
+  safetyAccumulators.eco2PPM.sum+=readInData;
+  accumulators.eco2PPM.sum+=readInData;
+  if (isMax(readInData, safetyAccumulators.eco2PPM.sum)){
+    safetyAccumulators.eco2PPM.maximum = readInData;
+  }
+  if (isMax(readInData, accumulators.eco2PPM.sum)){
+    accumulators.eco2PPM.maximum=readInData;
+  }
+
+  readInData = rawData.sgp30.tvocPPB.value;
+
+  safetyAccumulators.tvocPPB.sum+=readInData;
+  accumulators.tvocPPB.sum+=readInData;
+  if (isMax(readInData, safetyAccumulators.tvocPPB.sum)){
+    safetyAccumulators.tvocPPB.maximum = readInData;
+  }
+  if (isMax(readInData, accumulators.tvocPPB.sum)){
+    accumulators.tvocPPB.maximum=readInData;
+  }
+
+  readInData = rawData.pm25.concentration.value;
+
+  safetyAccumulators.pm25UGM3.sum+=readInData;
+  accumulators.pm25UGM3.sum+=readInData;
+  if (isMax(readInData, safetyAccumulators.pm25UGM3.sum)){
+    safetyAccumulators.pm25UGM3.maximum = readInData;
+  }
+  if (isMax(readInData, accumulators.pm25UGM3.sum)){
+    accumulators.pm25UGM3.maximum=readInData;
+  }
+
+  readInData = rawData.tempHum.humidityPercent.value;
+
+  safetyAccumulators.humidityPercent.sum+=readInData;
+  accumulators.humidityPercent.sum+=readInData;
+  if (isMax(readInData, safetyAccumulators.humidityPercent.sum)){
+    safetyAccumulators.humidityPercent.maximum = readInData;
+  }
+  if (isMax(readInData, accumulators.humidityPercent.sum)){
+    accumulators.humidityPercent.maximum=readInData;
+  }
+
+  readInData = rawData.tempHum.temperatureC.value;
+
+  safetyAccumulators.temperatureC.sum+=readInData;
+  accumulators.temperatureC.sum+=readInData;
+  if (isMax(readInData, safetyAccumulators.temperatureC.sum)){
+    safetyAccumulators.temperatureC.maximum = readInData;
+  }
+  if (isMax(readInData, accumulators.temperatureC.sum)){
+    accumulators.temperatureC.maximum=readInData;
+  }
 }
+
+
+
+/// @brief returns true if val1 > val2 
+/// @param val1 
+/// @param val2 
+/// @return bool
+bool isMax(int val1, int val2){
+  return (val1 > val2) ? true: false;
+}
+
 // ============================================================
 /* DATA PROCESSING & FAULT DETECTION */
 // ============================================================
@@ -475,18 +552,59 @@ struct ProcessedData {
   AverageData pm25UGM3;
 };*/
 
-//I don't want the original struct to be able to be altered, since it contains the raw data, so
-//it is not going to be a pointer
-int processData(){
-  //average values out based on what is in each struct and add it to new structs that average the total
+/// @brief processes the raw data into averaged data. If this is called with 
+///        option = true, process the 60 second data. else, process the 5 second data.
+/// @param option 
+/// @return 
+int processData(bool option){
 
-  struct ProcessedData processed;
+  if (option){
+    loggedData.coPPM.average=accumulators.coPPM.sum/accumulators.coPPM.count;
+    loggedData.coPPM.maximum=accumulators.coPPM.maximum;
+    //add windowendtimestamp
 
-  processed.coPPM;
+    loggedData.eco2PPM.average=accumulators.eco2PPM.sum/accumulators.eco2PPM.count;
+    loggedData.eco2PPM.maximum=accumulators.eco2PPM.maximum;
+    //add windowendtimestamp
 
-  //compare sensor readings to threshold values 
+    loggedData.humidityPercent.average=accumulators.humidityPercent.sum/accumulators.humidityPercent.count;
+    loggedData.humidityPercent.maximum=accumulators.humidityPercent.maximum;
+    //add windowendtimestamp
 
-  //return enum error report if error occuring
+    loggedData.pm25UGM3.average=accumulators.pm25UGM3.sum/accumulators.pm25UGM3.count;
+    loggedData.pm25UGM3.maximum=accumulators.pm25UGM3.maximum;
+    //add windowendtimestamp
+
+    loggedData.temperatureC.average=accumulators.temperatureC.sum/accumulators.temperatureC.count;
+    loggedData.temperatureC.maximum=accumulators.temperatureC.maximum;
+    //add windowendtimestamp
+
+    loggedData.tvocPPB.average=accumulators.tvocPPB.sum/accumulators.tvocPPB.count;
+    loggedData.tvocPPB.maximum=accumulators.tvocPPB.maximum;
+    //add windowendtimestamp
+    
+    //maybe call storedata here?
+  }
+    //it will also update the screen data, so not in an else
+    displayData.coPPM.average=safetyAccumulators.coPPM.sum/safetyAccumulators.coPPM.count;
+    displayData.coPPM.maximum=safetyAccumulators.coPPM.maximum;
+  
+    displayData.eco2PPM.average=safetyAccumulators.eco2PPM.sum/safetyAccumulators.eco2PPM.count;
+    displayData.eco2PPM.maximum=safetyAccumulators.eco2PPM.maximum;
+  
+    displayData.humidityPercent.average=safetyAccumulators.humidityPercent.sum/safetyAccumulators.humidityPercent.count;
+    displayData.humidityPercent.maximum=safetyAccumulators.humidityPercent.maximum;
+  
+    displayData.pm25UGM3.average=safetyAccumulators.pm25UGM3.sum/safetyAccumulators.pm25UGM3.count;
+    displayData.pm25UGM3.maximum=safetyAccumulators.pm25UGM3.maximum;
+  
+    displayData.temperatureC.average=safetyAccumulators.temperatureC.sum/safetyAccumulators.temperatureC.count;
+    displayData.temperatureC.maximum=safetyAccumulators.temperatureC.maximum;
+
+    displayData.tvocPPB.average=safetyAccumulators.tvocPPB.sum/safetyAccumulators.tvocPPB.count;
+    displayData.tvocPPB.maximum=safetyAccumulators.tvocPPB.maximum;
+
+    //maybe call updatedisplay?
 }
 
 int faultDetections(){
