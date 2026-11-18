@@ -1,0 +1,1791 @@
+// Air quality monitor (PORTRAIT 240x320): ST7789V + JOYSTICK (VRx, VRy, SW) + buzzer + REAL sensors
+//   SGP30  (eCO2 / TVOC)         I2C  SDA 21, SCL 22, address 0x58
+//   MQ-7   (CO, relative)        AO -> 10k -> wire -> GPIO 36 (+ 20k from GPIO 36 to GND, AT the ESP32)
+//   AM2302 (temperature / humidity)  DATA on GPIO 13
+//   Joystick  VRx -> GPIO 34, VRy -> GPIO 35, SW -> GPIO 32, VCC -> 3.3V (NOT 5V), GND
+// Libraries: "Adafruit GFX Library", "Adafruit ST7735 and ST7789 Library",
+//            "Adafruit SGP30 Sensor", "DHT sensor library" (Adafruit), "Adafruit Unified Sensor"
+//
+// JOYSTICK MODE (axes working). The menu actions below are the LOGICAL directions.
+// Which physical push triggers each one is set by the MAP_PHYS_* table in the options.
+//   Main pages   : LEFT / RIGHT = previous / next page (Gas, CO, Climate) | CLICK = open Settings
+//   Settings     : UP / DOWN = select (Sensors, Buzzer, Back)  | CLICK = open | LEFT = back
+//   Sensors page : CLICK or LEFT = back
+//   Buzzer page  : UP / DOWN = row (Volume, TEST SOUND, BACK)
+//                  LEFT / RIGHT on Volume = volume -/+ (hold the stick to keep changing, release to stop)
+//                  CLICK = sample beep / TEST SOUND / BACK (saves)
+//   RED alarm    : CLICK silences the buzzer + ALERT notification (the page keeps flashing red)
+// BUTTON-ONLY MODE (automatic if the axes look broken at boot): TAP = next, HOLD (0.6 s) = open / change.
+//
+// Power-on: cute boot animation + startup music, then the sensor check (and a joystick check).
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <Adafruit_SGP30.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include <math.h>
+
+// ---------- Pins ----------
+#define TFT_CS      5
+#define TFT_DC      27
+#define TFT_RST     26
+#define BUZZER_PIN  25
+#define JOY_X       34     // VRx
+#define JOY_Y       35     // VRy
+#define SW_PIN      32     // joystick button (SW), wired to GND when pressed
+#define SDA_PIN     21
+#define SCL_PIN     22
+#define DHT_PIN     13
+#define DHT_TYPE    DHT22  // the AM2302 uses the DHT22 setting
+#define MQ7_PIN     36     // VP
+#define MQ7_DIVIDER 1.5f   // (10k + 20k) / 20k
+
+// ---------- Options ----------
+#define USE_JOYSTICK_AXES true   // false = ignore VRx / VRy completely (button-only mode)
+
+// STICK REMAP: which menu action each physical push of the stick does.
+// Choose from DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT (each one used exactly once).
+// Current setting = the stick turned 90 degrees:  up -> right, down -> left, left -> up, right -> down
+#define MAP_PHYS_UP     DIR_RIGHT
+#define MAP_PHYS_DOWN   DIR_LEFT
+#define MAP_PHYS_LEFT   DIR_UP
+#define MAP_PHYS_RIGHT  DIR_DOWN
+
+#define GREEN_BEEP     true      // false = no beeping while the air is GOOD
+#define LONG_PRESS_MS  600       // button-only mode: how long to hold for a "HOLD"
+#define VOL_STEP_MS    300       // button-only mode: time between volume steps while holding
+#define SERIAL_DEBUG   true      // print all readings to the Serial Monitor (115200)
+
+// Joystick tuning (as a fraction of the stick travel on each side of the centre)
+const float JOY_ENGAGE  = 0.50f;   // push farther than this to register a move
+const float JOY_RELEASE = 0.25f;   // must come back below this before the next move counts
+
+// Buzzer pitch used for the alert beeps and tests. Passive buzzers are loudest at one frequency.
+#define BUZZ_FREQ 2500
+
+// Alarm thresholds
+const int   CO2_MODERATE = 1000;   // eCO2 ppm
+const int   CO2_HIGH     = 1500;
+const float MQ_MODERATE  = 0.25f;  // MQ-7: rise of the AO voltage above its clean-air baseline (V)
+const float MQ_HIGH      = 0.50f;
+const unsigned long MQ_WARM_MS = 120000UL;   // MQ-7 warm-up (2 min). A new sensor needs 24-48 h of burn-in.
+
+// MQ-7 connection check
+const float MQ_MIN_PIN_V = 0.04f;  // voltage on the ESP32 pin below this = no signal (AO / wire disconnected)
+const float MQ_MAX_NOISE = 0.20f;  // more noise than this inside one burst = floating pin / bad contact
+
+#define SCR_W 240
+#define SCR_H 320
+
+#define COL_HEADER 0x2104
+#define COL_GREY   0x4208
+#define COL_LIGHT  0x7BEF
+
+// Alert beep patterns: {time from one beep start to the next (ms), beep length (ms)}
+struct BeepPattern { unsigned int period; unsigned int onTime; };
+const BeepPattern BEEPS[3] = {
+  {2500, 150},   // GREEN : one slow beep
+  { 800, 200},   // YELLOW: faster
+  { 250, 125},   // RED   : rapid beeps (4 per second)
+};
+
+// Startup music: {frequency Hz (0 = rest), length ms}. Edit this table to change the tune.
+struct Note { uint16_t f; uint16_t ms; };
+const Note MELODY[] = {
+  { 523, 110}, { 659, 110}, { 784, 110}, {1047, 230}, {0,  70},
+  { 784,  90}, {1047,  90}, {1319,  90}, {1568, 260}, {0,  80},
+  {1319,  90}, {1568,  90}, {2093, 450}
+};
+const int MELODY_LEN = sizeof(MELODY) / sizeof(MELODY[0]);
+
+// Little sparkle chimes at the end of the boot animation: {start time ms, frequency Hz, length ms}
+struct Chime { uint16_t at; uint16_t f; uint16_t ms; };
+const Chime CHIMES[] = { {2950, 2637, 90}, {3090, 3136, 90}, {3230, 3951, 260} };
+const int CHIME_LEN = sizeof(CHIMES) / sizeof(CHIMES[0]);
+
+#define BOOT_ANIM_MS 3800     // total length of the boot animation
+#define FLASH_MS 350          // red flash speed
+
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, TFT_RST);
+Adafruit_SGP30 sgp;
+DHT dht(DHT_PIN, DHT_TYPE);
+Preferences prefs;
+
+// ---------- PWM helpers (ESP32 Arduino core 2.x and 3.x) ----------
+#define BUZZER_CH 0
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  void pwmBegin() { ledcAttachChannel(BUZZER_PIN, BUZZ_FREQ, 8, BUZZER_CH); }
+  void buzzerFreq(int f) { ledcChangeFrequency(BUZZER_PIN, f, 8); }
+  void buzzerOn(int duty) { ledcWrite(BUZZER_PIN, duty); }
+  void buzzerOff() { ledcWrite(BUZZER_PIN, 0); }
+#else
+  void pwmBegin() {
+    ledcSetup(BUZZER_CH, BUZZ_FREQ, 8);
+    ledcAttachPin(BUZZER_PIN, BUZZER_CH);
+  }
+  void buzzerFreq(int f) { ledcSetup(BUZZER_CH, f, 8); }
+  void buzzerOn(int duty) { ledcWrite(BUZZER_CH, duty); }
+  void buzzerOff() { ledcWrite(BUZZER_CH, 0); }
+#endif
+
+// ---------- Settings ----------
+int volume = 5;    // 0..10 (0 = muted)
+
+const uint8_t VOL_DUTY[11] = {0, 12, 28, 44, 60, 76, 92, 106, 116, 124, 128};
+int volumeDuty() { return VOL_DUTY[constrain(volume, 0, 10)]; }
+
+// Blocking beep (at BUZZ_FREQ): used for the volume sample, the TEST SOUND and boot warnings
+void beepMs(int ms) {
+  if (volume == 0) return;
+  buzzerOn(volumeDuty());
+  delay(ms);
+  buzzerOff();
+}
+
+void loadSettings() {
+  prefs.begin("gasmon", false);
+  volume = constrain(prefs.getInt("vol", 5), 0, 10);
+}
+
+void saveSettings() {
+  prefs.putInt("vol", volume);
+}
+
+// ---------- Buzzer task (alert beeps run on their own core, independent from drawing) ----------
+volatile int beepMode = -1;    // -1 = silent, 0 = green, 1 = yellow, 2 = red
+volatile int beepDuty = 0;
+
+void buzzerTask(void *param) {
+  for (;;) {
+    int m = beepMode;
+    if (m < 0 || m > 2) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+
+    const BeepPattern &p = BEEPS[m];
+
+    buzzerOn(beepDuty);
+    unsigned long t0 = millis();
+    while (millis() - t0 < p.onTime && beepMode == m) vTaskDelay(pdMS_TO_TICKS(5));
+    buzzerOff();
+
+    t0 = millis();
+    while (millis() - t0 < (p.period - p.onTime) && beepMode == m) vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// ---------- Button: TAP and HOLD ----------
+enum { BTN_NONE, BTN_TAP, BTN_HOLD };
+
+bool btnDown = false;      // debounced "button is pressed right now"
+
+int readButton() {
+  static bool stable = false, lastRaw = false, holdFired = false;
+  static unsigned long changedAt = 0, pressedAt = 0;
+  unsigned long now = millis();
+
+  bool raw = (digitalRead(SW_PIN) == LOW);
+  if (raw != lastRaw) { lastRaw = raw; changedAt = now; }
+
+  if (now - changedAt > 30 && stable != raw) {
+    stable = raw;
+    btnDown = raw;
+    if (stable) {
+      pressedAt = now;
+      holdFired = false;
+    } else {
+      return holdFired ? BTN_NONE : BTN_TAP;     // released
+    }
+  }
+
+  if (stable && !holdFired && now - pressedAt >= LONG_PRESS_MS) {
+    holdFired = true;
+    return BTN_HOLD;
+  }
+  return BTN_NONE;
+}
+
+// ---------- Joystick axes (VRx / VRy) ----------
+enum { DIR_NONE, DIR_LEFT, DIR_RIGHT, DIR_UP, DIR_DOWN };
+
+// Physical push (as the axes read it) -> logical menu action, from the MAP_PHYS_* options
+const int DIR_MAP[5] = { DIR_NONE, MAP_PHYS_LEFT, MAP_PHYS_RIGHT, MAP_PHYS_UP, MAP_PHYS_DOWN };
+const char* DIR_NAMES[5] = { "", "Left", "Right", "Up", "Down" };
+const char* DIR_INIT[5]  = { "", "L", "R", "U", "D" };
+
+// Name of the physical push that triggers a logical action (used in the on-screen hints)
+const char* physName(int logical) {
+  for (int p = 1; p <= 4; p++) if (DIR_MAP[p] == logical) return DIR_NAMES[p];
+  return "?";
+}
+
+const char* physInit(int logical) {
+  for (int p = 1; p <= 4; p++) if (DIR_MAP[p] == logical) return DIR_INIT[p];
+  return "?";
+}
+
+int  centerX = 2048, centerY = 2048;
+int  rawXnow = 0, rawYnow = 0;      // last raw readings (for the Serial Monitor)
+bool joyOK = false;                 // true = axes look healthy and are used
+char joyInfo[44] = "";
+
+int readAxis(int pin) {
+  long s = 0;
+  for (int i = 0; i < 8; i++) s += analogRead(pin);
+  return s / 8;
+}
+
+// Measures the resting centre and decides if the axes can be trusted.
+// A healthy stick at rest reads about 2000 on both axes and is steady.
+void calibrateJoystick() {
+  delay(100);
+  long sx = 0, sy = 0;
+  int minX = 4095, maxX = 0, minY = 4095, maxY = 0;
+  for (int i = 0; i < 32; i++) {
+    int x = analogRead(JOY_X);
+    int y = analogRead(JOY_Y);
+    sx += x; sy += y;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    delay(3);
+  }
+  centerX = sx / 32;
+  centerY = sy / 32;
+
+  bool inRange = (centerX > 1200 && centerX < 2900 && centerY > 1200 && centerY < 2900);
+  bool steady  = ((maxX - minX) < 150) && ((maxY - minY) < 150);
+  joyOK = USE_JOYSTICK_AXES && inRange && steady;
+
+  if (!USE_JOYSTICK_AXES)
+    snprintf(joyInfo, sizeof(joyInfo), "Joystick axes disabled (button only)");
+  else if (joyOK)
+    snprintf(joyInfo, sizeof(joyInfo), "Joystick OK  X=%d Y=%d", centerX, centerY);
+  else
+    snprintf(joyInfo, sizeof(joyInfo), "Axes OFF X=%d Y=%d: button only", centerX, centerY);
+
+  Serial.printf("Joystick centre: x=%d y=%d  spreadX=%d spreadY=%d  -> %s\n",
+                centerX, centerY, maxX - minX, maxY - minY, joyOK ? "AXES ON" : "AXES OFF (button only)");
+}
+
+// How far the stick is pushed, from -1.0 to +1.0, using the room available on each side
+float axisFrac(int raw, int center) {
+  int d = raw - center;
+  int room = (d >= 0) ? (4095 - center) : center;
+  if (room < 200) room = 200;
+  float f = d / (float)room;
+  if (f > 1.0f) f = 1.0f;
+  if (f < -1.0f) f = -1.0f;
+  return f;
+}
+
+// Returns ONE logical direction per push (no repeats), unless allowRepeat is true
+// (only used for the volume row, logical left/right held).
+int readDirection(bool allowRepeat) {
+  static int held = DIR_NONE;
+  static unsigned long heldSince = 0, lastRepeat = 0, releasedAt = 0;
+  unsigned long now = millis();
+
+  int rawX = readAxis(JOY_X);
+  int rawY = readAxis(JOY_Y);
+  rawXnow = rawX;
+  rawYnow = rawY;
+
+  float fx = axisFrac(rawX, centerX);
+  float fy = axisFrac(rawY, centerY);
+  float ax = fabsf(fx), ay = fabsf(fy);
+  float big = fmaxf(ax, ay);
+
+  if (held != DIR_NONE) {
+    if (big < JOY_RELEASE) {            // stick came back to the middle
+      held = DIR_NONE;
+      releasedAt = now;
+      return DIR_NONE;
+    }
+    if (allowRepeat && (held == DIR_LEFT || held == DIR_RIGHT) &&
+        now - heldSince > 450 && now - lastRepeat > 140) {
+      lastRepeat = now;
+      return held;
+    }
+    return DIR_NONE;
+  }
+
+  if (now - releasedAt < 150) return DIR_NONE;   // ignore the spring bounce after release
+  if (big < JOY_ENGAGE) return DIR_NONE;
+
+  // Only the clearly dominant axis counts, diagonals are ignored
+  int dRaw;
+  if (ax > ay * 1.5f)      dRaw = (fx > 0) ? DIR_RIGHT : DIR_LEFT;
+  else if (ay > ax * 1.5f) dRaw = (fy > 0) ? DIR_DOWN  : DIR_UP;
+  else return DIR_NONE;
+
+  int d = DIR_MAP[dRaw];                          // apply the remap table
+#if SERIAL_DEBUG
+  Serial.printf("Stick pushed %s -> action %s\n", DIR_NAMES[dRaw], DIR_NAMES[d]);
+#endif
+
+  held = d;
+  heldSince = now;
+  lastRepeat = now;
+  return d;
+}
+
+// ======================================================================
+//                              SENSORS
+// ======================================================================
+enum SensorState { ST_CHECK, ST_WARM, ST_OK, ST_FAIL };
+SensorState sgpState = ST_CHECK, dhtState = ST_CHECK, mqState = ST_CHECK;
+
+// SGP30
+int co2 = 400, tvoc = 0;
+unsigned long sgpWarmUntil = 0, lastSgpRetry = 0;
+int sgpFails = 0;
+
+// AM2302
+float tempC = 0, humidity = 0;
+int dhtFails = 0;
+
+// MQ-7
+float mqAO = 0, mqBase = 0, mqRise = 0;
+float mqPinV = 0;          // voltage on the ESP32 pin (median of a burst), volts
+float mqSpread = 0;        // noise inside the burst (max - min), volts
+unsigned long mqWarmStart = 0;
+int mqBad = 0;             // consecutive bad readings
+int mqOkRun = 0;           // consecutive good readings
+
+// Levels: 0 = good, 1 = moderate, 2 = high
+int sgpLvl = 0, mqLvl = 0, gasLvl = 0;
+bool gasUnknown = true;     // true when no gas sensor gives valid data
+
+// ---- SGP30 ----
+bool sgpInit() {
+  if (!sgp.begin()) return false;
+  sgpWarmUntil = millis() + 15000UL;     // the first ~15 s always read 400 ppm / 0 ppb
+  return true;
+}
+
+void updateSGP() {
+  unsigned long now = millis();
+
+  if (sgpState == ST_FAIL) {             // try to reconnect every 10 s
+    if (now - lastSgpRetry >= 10000UL) {
+      lastSgpRetry = now;
+      if (sgpInit()) { sgpState = ST_WARM; sgpFails = 0; }
+    }
+    return;
+  }
+
+  if (!sgp.IAQmeasure()) {
+    if (++sgpFails >= 3) { sgpState = ST_FAIL; lastSgpRetry = now; }
+    return;
+  }
+  sgpFails = 0;
+  co2  = sgp.eCO2;
+  tvoc = sgp.TVOC;
+  sgpState = (now < sgpWarmUntil) ? ST_WARM : ST_OK;
+}
+
+// ---- AM2302 ----
+void updateDHT() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (isnan(h) || isnan(t)) {
+    if (dhtFails < 100) dhtFails++;
+    if (dhtFails >= 3) dhtState = ST_FAIL;
+    return;
+  }
+  dhtFails = 0;
+  tempC = t;
+  humidity = h;
+  dhtState = ST_OK;
+}
+
+// ---- MQ-7 ----
+// One reading of the MQ-7 pin: a burst of 16 samples -> median voltage + noise spread
+void readMQpin() {
+  int mv[16];
+  for (int i = 0; i < 16; i++) {
+    mv[i] = analogReadMilliVolts(MQ7_PIN);
+    delayMicroseconds(300);
+  }
+  for (int i = 1; i < 16; i++) {          // sort (insertion sort)
+    int k = mv[i], j = i - 1;
+    while (j >= 0 && mv[j] > k) { mv[j + 1] = mv[j]; j--; }
+    mv[j + 1] = k;
+  }
+  mqPinV   = (mv[7] + mv[8]) / 2000.0f;   // median
+  mqSpread = (mv[14] - mv[1]) / 1000.0f;  // spread, ignoring the single highest / lowest sample
+}
+
+// A connected MQ-7 gives a steady voltage clearly above 0 V.
+// A disconnected pin reads ~0 V (held down by the 20k at the pin) or noisy random values.
+bool mqSignalGood() {
+  return (mqPinV >= MQ_MIN_PIN_V) && (mqSpread <= MQ_MAX_NOISE);
+}
+
+void updateMQ() {
+  readMQpin();
+  mqAO = mqPinV * MQ7_DIVIDER;
+
+  if (mqSignalGood()) { if (mqOkRun < 100) mqOkRun++; mqBad = 0; }
+  else                { mqOkRun = 0; if (mqBad < 100) mqBad++; }
+
+  if (mqBad >= 4) {                                  // 4 bad readings in a row (about 4 s)
+    mqState = ST_FAIL;
+    mqRise = 0;
+    return;
+  }
+  if (mqState == ST_FAIL && mqOkRun < 5) return;     // stay in ERROR until the signal is good for 5 s
+  if (mqBad > 0) return;                             // short glitch, keep the previous state
+
+  if (mqState == ST_FAIL || mqState == ST_CHECK) {   // (re)start warm-up
+    mqState = ST_WARM;
+    mqWarmStart = millis();
+    mqBase = mqAO;
+  }
+
+  if (millis() - mqWarmStart < MQ_WARM_MS) {          // warming up: just follow the signal
+    mqState = ST_WARM;
+    mqBase = mqAO;
+    mqRise = 0;
+    return;
+  }
+
+  // Adaptive clean-air baseline: follows the signal DOWN quickly, creeps UP very slowly
+  // (and never while the reading is clearly rising because of gas).
+  float rise = mqAO - mqBase;
+  if (rise < 0) mqBase += rise * 0.1f;
+  else if (rise < MQ_MODERATE * 0.5f) mqBase += rise * 0.002f;
+
+  mqRise = mqAO - mqBase;
+  if (mqRise < 0) mqRise = 0;
+  mqState = ST_OK;
+}
+
+// ---- Levels (with a little hysteresis so they don't flicker) ----
+void updateLevels() {
+  bool sgpValid = (sgpState == ST_OK);
+  bool mqValid  = (mqState == ST_OK);
+
+  if (sgpValid) {
+    int l = sgpLvl;
+    if (co2 >= CO2_HIGH) l = 2;
+    else if (co2 >= CO2_MODERATE && l < 1) l = 1;
+    if (l == 2 && co2 < CO2_HIGH - 50) l = 1;
+    if (l == 1 && co2 < CO2_MODERATE - 50) l = 0;
+    sgpLvl = l;
+  } else {
+    sgpLvl = 0;
+  }
+
+  if (mqValid) {
+    int l = mqLvl;
+    if (mqRise >= MQ_HIGH) l = 2;
+    else if (mqRise >= MQ_MODERATE && l < 1) l = 1;
+    if (l == 2 && mqRise < MQ_HIGH - 0.10f) l = 1;
+    if (l == 1 && mqRise < MQ_MODERATE - 0.08f) l = 0;
+    mqLvl = l;
+  } else {
+    mqLvl = 0;
+  }
+
+  gasUnknown = !(sgpValid || mqValid);
+  gasLvl = gasUnknown ? 0 : max(sgpLvl, mqLvl);
+}
+
+// 0 = comfortable, 1 = too cold, 2 = too hot, 3 = too dry, 4 = too humid
+int comfortState() {
+  if (tempC < 18.0) return 1;
+  if (tempC > 27.0) return 2;
+  if (humidity < 30.0) return 3;
+  if (humidity > 60.0) return 4;
+  return 0;
+}
+
+// Overall sensor summary (used by the settings menu and the status page)
+int sensorFaults() {
+  return (sgpState == ST_FAIL) + (dhtState == ST_FAIL) + (mqState == ST_FAIL);
+}
+
+bool sensorsWarming() {
+  return (sgpState == ST_WARM) || (mqState == ST_WARM);
+}
+
+int sensorSummary(char* buf, size_t n) {
+  int f = sensorFaults();
+  bool w = sensorsWarming();
+  if (f > 0)    snprintf(buf, n, "%d FAULT%s", f, f > 1 ? "S" : "");
+  else if (w)   snprintf(buf, n, "WARMING UP");
+  else          snprintf(buf, n, "ALL OK");
+  return f * 10 + (w ? 1 : 0);
+}
+
+// ======================================================================
+//                            UI STATE
+// ======================================================================
+enum { PAGE_GAS, PAGE_CO, PAGE_CLIMATE, SETTINGS_MENU, STATUS_PAGE, BUZZER_PAGE };
+#define NUM_MAIN 3
+
+int screen = PAGE_GAS;
+int returnPage = PAGE_GAS;
+int menuIndex = 0;   // 0 = sensors, 1 = buzzer, 2 = back
+int buzzRow = 0;     // 0 = volume, 1 = test, 2 = back
+
+// Button-only mode: hold-to-change volume
+bool adjusting = false;
+int volDir = -1;                 // flipped at the start of each hold, so the first hold goes UP
+unsigned long adjustLast = 0;
+
+bool alarmAcked = false;     // true after the user pressed the button during a RED alarm
+int shownMode = -1;          // 0 normal, 1 alert screen, 2 silenced flashing
+int shownKey = -1;           // colour key of the page currently drawn
+int areaKey = 0;             // 0 = values shown, 2 = error box shown
+int lastBannerKey = -1;
+bool flashPhase = false;
+unsigned long lastFlash = 0;
+unsigned long lastInput = 0;
+
+uint16_t pgBg = ST77XX_GREEN;
+uint16_t pgFg = ST77XX_BLACK;
+
+bool isMainPage(int s) { return s < SETTINGS_MENU; }
+int colorKey() { return gasUnknown ? 9 : gasLvl; }
+
+void setPageColors() {
+  if (gasUnknown)       { pgBg = ST77XX_ORANGE; pgFg = ST77XX_BLACK; }
+  else if (gasLvl == 0) { pgBg = ST77XX_GREEN;  pgFg = ST77XX_BLACK; }
+  else if (gasLvl == 1) { pgBg = ST77XX_YELLOW; pgFg = ST77XX_BLACK; }
+  else if (flashPhase)  { pgBg = ST77XX_RED;    pgFg = ST77XX_WHITE; }   // red flashing
+  else                  { pgBg = ST77XX_BLACK;  pgFg = ST77XX_RED;   }
+}
+
+// ---------- Text helpers ----------
+void printAt(const char* s, int x, int y, uint8_t size, uint16_t color) {
+  tft.setTextSize(size);
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(s);
+}
+
+void printCentered(const char* s, int cx, int y, uint8_t size, uint16_t color) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.setTextSize(size);
+  tft.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  tft.setTextColor(color);
+  tft.setCursor(cx - w / 2, y);
+  tft.print(s);
+}
+
+void printRight(const char* s, int xr, int y, uint8_t size, uint16_t color) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.setTextSize(size);
+  tft.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  tft.setTextColor(color);
+  tft.setCursor(xr - w, y);
+  tft.print(s);
+}
+
+// ---------- Icons ----------
+void drawGear(int cx, int cy, uint16_t c, uint16_t hole) {
+  for (int a = 0; a < 360; a += 45) {
+    float r = a * PI / 180.0;
+    tft.fillCircle(cx + cos(r) * 10, cy + sin(r) * 10, 2, c);
+  }
+  tft.fillCircle(cx, cy, 8, c);
+  tft.fillCircle(cx, cy, 3, hole);
+}
+
+void drawSpeaker(int cx, int cy, int s, uint16_t c, bool muted) {
+  tft.fillRect(cx - s, cy - s / 2, s / 2, s, c);
+  tft.fillTriangle(cx - s / 2, cy - s / 2, cx - s / 2, cy + s / 2, cx + s / 2, cy + s, c);
+  tft.fillTriangle(cx - s / 2, cy - s / 2, cx + s / 2, cy + s, cx + s / 2, cy - s, c);
+  if (muted) {
+    int x0 = cx + s / 2 + 6, x1 = x0 + s;
+    int y0 = cy - s / 2,     y1 = cy + s / 2;
+    tft.drawLine(x0, y0, x1, y1, ST77XX_RED);
+    tft.drawLine(x0 + 1, y0, x1 + 1, y1, ST77XX_RED);
+    tft.drawLine(x0, y1, x1, y0, ST77XX_RED);
+    tft.drawLine(x0 + 1, y1, x1 + 1, y0, ST77XX_RED);
+  } else {
+    int ax = cx + s / 2 + 2;
+    int r1 = (s * 85) / 100, r2 = (s * 130) / 100;
+    tft.drawCircleHelper(ax, cy, r1, 6, c);
+    tft.drawCircleHelper(ax, cy, r1 + 1, 6, c);
+    tft.drawCircleHelper(ax, cy, r2, 6, c);
+    tft.drawCircleHelper(ax, cy, r2 + 1, 6, c);
+  }
+}
+
+void drawChipIcon(int cx, int cy, uint16_t c) {
+  tft.drawRoundRect(cx - 11, cy - 11, 22, 22, 3, c);
+  tft.fillRect(cx - 5, cy - 5, 10, 10, c);
+  for (int i = -1; i <= 1; i++) {
+    tft.drawFastVLine(cx + i * 7, cy - 17, 6, c);
+    tft.drawFastVLine(cx + i * 7, cy + 12, 6, c);
+    tft.drawFastHLine(cx - 17, cy + i * 7, 6, c);
+    tft.drawFastHLine(cx + 12, cy + i * 7, 6, c);
+  }
+}
+
+// Header of the dark screens (boot check, settings)
+void drawHeader(const char* title) {
+  tft.fillRect(0, 0, SCR_W, 34, COL_HEADER);
+  printAt(title, 10, 9, 2, ST77XX_WHITE);
+}
+
+// Header of the main pages (same colour as the background)
+void drawMainHeader(const char* title) {
+  tft.fillRect(0, 0, SCR_W, 34, pgBg);
+  printAt(title, 10, 9, 2, pgFg);
+  drawGear(217, 17, pgFg, pgBg);
+  tft.drawRoundRect(196, 3, 42, 28, 5, pgFg);
+  tft.drawFastHLine(0, 34, SCR_W, pgFg);
+}
+
+void drawPageDots(int active) {
+  tft.fillRect(40, 218, 160, 24, pgBg);
+  for (int i = 0; i < NUM_MAIN; i++) {
+    int x = 120 - (NUM_MAIN - 1) * 8 + i * 16;
+    if (i == active) tft.fillCircle(x, 230, 4, pgFg);
+    else             tft.drawCircle(x, 230, 4, pgFg);
+  }
+}
+
+// Bottom banner: inverted colours (dark box, coloured text)
+void drawBanner(const char* top, const char* txt) {
+  tft.fillRect(0, 246, SCR_W, 74, pgFg);
+  printCentered(top, 120, 254, 2, pgBg);
+  printCentered(txt, 120, 282, 3, pgBg);
+}
+
+// Only redraws the banner when its content (key) changes
+void showBanner(int key, const char* top, const char* txt) {
+  if (key == lastBannerKey) return;
+  lastBannerKey = key;
+  drawBanner(top, txt);
+}
+
+// Big "sensor not working" notice
+void drawErrorBox(const char* name, const char* l1, const char* l2) {
+  tft.fillTriangle(120, 46, 90, 98, 150, 98, pgFg);
+  printCentered("!", 120, 64, 4, pgBg);
+  printCentered("SENSOR ERROR", 120, 108, 2, pgFg);
+  printCentered(name, 120, 130, 3, pgFg);
+  printCentered("NOT FUNCTIONAL", 120, 160, 2, pgFg);
+  printCentered(l1, 120, 186, 1, pgFg);
+  printCentered(l2, 120, 198, 1, pgFg);
+}
+
+// Hint line shown under the values on the main pages
+void drawMainHint() {
+  char b[44];
+  if (joyOK) {
+    snprintf(b, sizeof(b), "%s/%s: page   Click: settings", physName(DIR_LEFT), physName(DIR_RIGHT));
+    printCentered(b, 120, 208, 1, pgFg);
+  } else {
+    printCentered("Tap: page   Hold: settings", 120, 208, 1, pgFg);
+  }
+}
+
+// ======================================================================
+//                             GAS page (SGP30)
+// ======================================================================
+void gasBanner() {
+  unsigned long now = millis();
+  if (sgpState == ST_FAIL) { showBanner(100, "SGP30 SENSOR", "ERROR"); return; }
+  if (sgpState == ST_WARM) {
+    int s = (now < sgpWarmUntil) ? (int)((sgpWarmUntil - now + 999) / 1000) : 0;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d s", s);
+    showBanner(200 + s, "SGP30 WARMING UP", buf);
+    return;
+  }
+  bool sil = (gasLvl == 2 && alarmAcked);
+  const char* txt = (gasLvl == 0) ? "GOOD" : (gasLvl == 1) ? "MODERATE" : "HIGH!";
+  showBanner(gasLvl + (sil ? 10 : 0), sil ? "ALARM SILENCED" : "AIR QUALITY", txt);
+}
+
+void drawGauge() {
+  tft.fillRect(10, 180, 220, 26, pgBg);
+  tft.drawRect(10, 188, 220, 14, pgFg);
+  int fillW = map(constrain(co2, 400, 2000), 400, 2000, 0, 216);
+  if (fillW > 0) tft.fillRect(12, 190, fillW, 10, pgFg);
+  tft.drawFastVLine(12 + (CO2_MODERATE - 400) * 216 / 1600, 182, 6, pgFg);
+  tft.drawFastVLine(12 + (CO2_HIGH - 400) * 216 / 1600, 182, 6, pgFg);
+}
+
+void drawGasValues() {
+  if (areaKey == 0) {
+    tft.fillRect(10, 66, 220, 36, pgBg);
+    tft.setTextColor(pgFg);
+    tft.setTextSize(4);
+    tft.setCursor(10, 68);
+    tft.print(co2);
+    printAt("ppm", 130, 82, 2, pgFg);
+
+    tft.fillRect(10, 138, 220, 36, pgBg);
+    tft.setTextColor(pgFg);
+    tft.setTextSize(4);
+    tft.setCursor(10, 140);
+    tft.print(tvoc);
+    printAt("ppb", 130, 154, 2, pgFg);
+
+    drawGauge();
+  }
+  gasBanner();
+}
+
+void drawGasPage() {
+  tft.fillScreen(pgBg);
+  drawMainHeader("GAS MONITOR");
+  areaKey = (sgpState == ST_FAIL) ? 2 : 0;
+  if (areaKey == 2) {
+    drawErrorBox("SGP30", "Check wiring: SDA 21, SCL 22", "3.3V and GND, address 0x58");
+  } else {
+    printAt("eCO2", 10, 46, 2, pgFg);
+    printAt("TVOC", 10, 118, 2, pgFg);
+  }
+  drawMainHint();
+  drawPageDots(0);
+  lastBannerKey = -1;
+  drawGasValues();
+}
+
+// ======================================================================
+//                              CO page (MQ-7)
+// ======================================================================
+void coBanner() {
+  unsigned long now = millis();
+  if (mqState == ST_FAIL) { showBanner(100, "MQ-7 SENSOR", "ERROR"); return; }
+  if (mqState == ST_WARM) {
+    unsigned long el = now - mqWarmStart;
+    int s = (el < MQ_WARM_MS) ? (int)((MQ_WARM_MS - el + 999) / 1000) : 0;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d s", s);
+    showBanner(300 + s, "MQ-7 WARMING UP", buf);
+    return;
+  }
+  bool sil = (gasLvl == 2 && alarmAcked);
+  const char* txt = (mqLvl == 0) ? "NORMAL" : (mqLvl == 1) ? "ELEVATED" : "HIGH!";
+  showBanner(mqLvl + (sil ? 10 : 0), sil ? "ALARM SILENCED" : "CO SENSOR", txt);
+}
+
+void drawCOValues() {
+  if (areaKey == 0) {
+    char buf[20];
+
+    tft.fillRect(10, 66, 220, 36, pgBg);
+    snprintf(buf, sizeof(buf), "%.2f V", mqAO);
+    tft.setTextSize(4);
+    tft.setTextColor(pgFg);
+    tft.setCursor(10, 68);
+    tft.print(buf);
+
+    tft.fillRect(10, 104, 220, 10, pgBg);
+    snprintf(buf, sizeof(buf), "baseline %.2f V", mqBase);
+    printAt(buf, 10, 105, 1, pgFg);
+
+    tft.fillRect(10, 138, 220, 36, pgBg);
+    if (mqState == ST_OK) snprintf(buf, sizeof(buf), "%+.2f V", mqRise);
+    else                  snprintf(buf, sizeof(buf), "-- V");
+    tft.setTextSize(4);
+    tft.setTextColor(pgFg);
+    tft.setCursor(10, 140);
+    tft.print(buf);
+
+    // Rise bar 0..1.0 V with marks at the moderate and high thresholds
+    tft.fillRect(10, 180, 220, 26, pgBg);
+    tft.drawRect(10, 188, 220, 14, pgFg);
+    float r = (mqState == ST_OK) ? constrain(mqRise, 0.0f, 1.0f) : 0.0f;
+    int fillW = (int)(r * 216);
+    if (fillW > 0) tft.fillRect(12, 190, fillW, 10, pgFg);
+    tft.drawFastVLine(12 + (int)(MQ_MODERATE * 216), 182, 6, pgFg);
+    tft.drawFastVLine(12 + (int)(MQ_HIGH * 216), 182, 6, pgFg);
+  }
+  coBanner();
+}
+
+void drawCOPage() {
+  tft.fillScreen(pgBg);
+  drawMainHeader("CO SENSOR");
+  areaKey = (mqState == ST_FAIL) ? 2 : 0;
+  if (areaKey == 2) {
+    drawErrorBox("MQ-7", "No stable signal on GPIO 36 (VP)", "Check AO wire, 5V, GND, divider");
+  } else {
+    printAt("SIGNAL (AO)", 10, 46, 2, pgFg);
+    printAt("RISE", 10, 118, 2, pgFg);
+  }
+  drawMainHint();
+  drawPageDots(1);
+  lastBannerKey = -1;
+  drawCOValues();
+}
+
+// ======================================================================
+//                         CLIMATE page (AM2302)
+// ======================================================================
+void climateBanner() {
+  if (dhtState == ST_FAIL) { showBanner(100, "AM2302 SENSOR", "ERROR"); return; }
+  static const char* names[] = {"COMFORTABLE", "TOO COLD", "TOO HOT", "TOO DRY", "TOO HUMID"};
+  int cs = comfortState();
+  bool sil = (gasLvl == 2 && alarmAcked);
+  showBanner(cs + (sil ? 10 : 0), sil ? "ALARM SILENCED" : "COMFORT", names[cs]);
+}
+
+void drawClimateValues() {
+  if (areaKey == 0) {
+    char buf[12];
+
+    tft.fillRect(10, 66, 220, 40, pgBg);
+    snprintf(buf, sizeof(buf), "%.1f", tempC);
+    tft.setTextSize(4);
+    tft.setTextColor(pgFg);
+    tft.setCursor(10, 68);
+    tft.print(buf);
+    int x = tft.getCursorX();
+    tft.drawCircle(x + 8, 74, 5, pgFg);   // degree sign
+    tft.drawCircle(x + 8, 74, 4, pgFg);
+    tft.setCursor(x + 20, 68);
+    tft.print("C");
+
+    tft.fillRect(10, 138, 220, 40, pgBg);
+    snprintf(buf, sizeof(buf), "%.0f%%", humidity);
+    tft.setTextSize(4);
+    tft.setTextColor(pgFg);
+    tft.setCursor(10, 140);
+    tft.print(buf);
+
+    // Humidity bar (marks at 30% and 60%)
+    tft.fillRect(10, 180, 220, 26, pgBg);
+    tft.drawRect(10, 188, 220, 14, pgFg);
+    float h = constrain(humidity, 0.0f, 100.0f);
+    int fillW = (int)(h * 216 / 100);
+    if (fillW > 0) tft.fillRect(12, 190, fillW, 10, pgFg);
+    tft.drawFastVLine(12 + 30 * 216 / 100, 182, 6, pgFg);
+    tft.drawFastVLine(12 + 60 * 216 / 100, 182, 6, pgFg);
+  }
+  climateBanner();
+}
+
+void drawClimatePage() {
+  tft.fillScreen(pgBg);
+  drawMainHeader("CLIMATE");
+  areaKey = (dhtState == ST_FAIL) ? 2 : 0;
+  if (areaKey == 2) {
+    drawErrorBox("AM2302", "Check DATA wire on GPIO 13", "3.3V, GND (10k pull-up?)");
+  } else {
+    printAt("TEMPERATURE", 10, 46, 2, pgFg);
+    printAt("HUMIDITY", 10, 118, 2, pgFg);
+  }
+  drawMainHint();
+  drawPageDots(2);
+  lastBannerKey = -1;
+  drawClimateValues();
+}
+
+// ======================================================================
+//                  STATUS page (sensor checkup, inside Settings)
+// ======================================================================
+// NOTE: these take an int (not SensorState) so the Arduino auto-generated prototypes compile
+const char* stateWord(int s) {
+  switch (s) {
+    case ST_OK:   return "OK";
+    case ST_WARM: return "WARMING";
+    case ST_FAIL: return "ERROR";
+    default:      return "...";
+  }
+}
+
+uint16_t stateColor(int s) {
+  switch (s) {
+    case ST_OK:   return ST77XX_GREEN;
+    case ST_WARM: return ST77XX_YELLOW;
+    case ST_FAIL: return ST77XX_RED;
+    default:      return COL_LIGHT;
+  }
+}
+
+void drawStatusRow(int i, bool force) {
+  static char prevVal[3][40];
+  static int prevSt[3] = {-1, -1, -1};
+
+  const char* name;
+  const char* pins;
+  SensorState st;
+  char val[40];
+
+  if (i == 0) {
+    name = "SGP30"; pins = "I2C 0x58  SDA 21  SCL 22"; st = sgpState;
+    if (st == ST_FAIL) snprintf(val, sizeof(val), "Not responding - check wiring");
+    else snprintf(val, sizeof(val), "eCO2 %d ppm  TVOC %d ppb", co2, tvoc);
+  } else if (i == 1) {
+    name = "AM2302"; pins = "DATA on GPIO 13"; st = dhtState;
+    if (st == ST_FAIL) snprintf(val, sizeof(val), "No data - check DATA / pull-up");
+    else snprintf(val, sizeof(val), "%.1f C   %.0f %% RH", tempC, humidity);
+  } else {
+    name = "MQ-7"; pins = "AO on GPIO 36 (divider)"; st = mqState;
+    if (st == ST_FAIL) snprintf(val, sizeof(val), "No stable signal - check AO / VP");
+    else if (st == ST_WARM) snprintf(val, sizeof(val), "AO %.2f V  warming up", mqAO);
+    else snprintf(val, sizeof(val), "AO %.2f V  rise %+.2f V", mqAO, mqRise);
+  }
+
+  if (!force && prevSt[i] == (int)st && strcmp(prevVal[i], val) == 0) return;
+  prevSt[i] = (int)st;
+  strncpy(prevVal[i], val, sizeof(prevVal[i]));
+  prevVal[i][sizeof(prevVal[i]) - 1] = 0;
+
+  int y0 = 44 + i * 62;
+  tft.fillRect(0, y0 - 2, SCR_W, 60, ST77XX_BLACK);
+  tft.drawRoundRect(6, y0, 228, 56, 6, st == ST_FAIL ? ST77XX_RED : COL_GREY);
+  printAt(name, 14, y0 + 6, 2, ST77XX_WHITE);
+  printRight(stateWord((int)st), 226, y0 + 6, 2, stateColor((int)st));
+  printAt(pins, 14, y0 + 26, 1, COL_LIGHT);
+  printAt(val, 14, y0 + 40, 1, st == ST_FAIL ? ST77XX_RED : ST77XX_WHITE);
+}
+
+void drawStatusRows(bool force) {
+  for (int i = 0; i < 3; i++) drawStatusRow(i, force);
+}
+
+void drawStatusSummary(bool force) {
+  static int lastKey = -1;
+  char buf[16];
+  int key = sensorSummary(buf, sizeof(buf));
+  if (!force && key == lastKey) return;
+  lastKey = key;
+
+  uint16_t c = (sensorFaults() > 0) ? ST77XX_RED : sensorsWarming() ? ST77XX_YELLOW : ST77XX_GREEN;
+  tft.fillRect(0, 232, SCR_W, 60, ST77XX_BLACK);
+  printCentered("SENSOR CHECK", 120, 238, 1, COL_LIGHT);
+  printCentered(buf, 120, 254, 3, c);
+}
+
+void drawStatusPage() {
+  char b[40];
+  tft.fillScreen(ST77XX_BLACK);
+  drawHeader("SENSOR STATUS");
+  drawStatusRows(true);
+  drawStatusSummary(true);
+  printCentered(joyInfo, 120, 296, 1, joyOK ? COL_LIGHT : ST77XX_YELLOW);
+  if (joyOK) snprintf(b, sizeof(b), "Click or %s: back", physName(DIR_LEFT));
+  else       snprintf(b, sizeof(b), "Tap or hold: back");
+  printCentered(b, 120, 308, 1, COL_LIGHT);
+}
+
+// ======================================================================
+//                       Main page dispatch + alert
+// ======================================================================
+void drawMainPage(int s) {
+  setPageColors();
+  switch (s) {
+    case PAGE_GAS:     drawGasPage(); break;
+    case PAGE_CO:      drawCOPage(); break;
+    case PAGE_CLIMATE: drawClimatePage(); break;
+  }
+}
+
+int areaKeyFor(int s) {
+  if (s == PAGE_GAS)     return (sgpState == ST_FAIL) ? 2 : 0;
+  if (s == PAGE_CO)      return (mqState == ST_FAIL) ? 2 : 0;
+  if (s == PAGE_CLIMATE) return (dhtState == ST_FAIL) ? 2 : 0;
+  return 0;
+}
+
+void drawValuesFor(int s) {
+  switch (s) {
+    case PAGE_GAS:     drawGasValues(); break;
+    case PAGE_CO:      drawCOValues(); break;
+    case PAGE_CLIMATE: drawClimateValues(); break;
+  }
+}
+
+// RED ALERT screen (full screen, flashes red / black)
+void drawAlertScreen(bool phase) {
+  uint16_t bg = phase ? ST77XX_RED : ST77XX_BLACK;
+  uint16_t fg = phase ? ST77XX_WHITE : ST77XX_RED;
+  char buf[28];
+
+  tft.fillScreen(bg);
+  tft.fillTriangle(120, 24, 76, 100, 164, 100, fg);
+  printCentered("!", 120, 52, 5, bg);
+  printCentered("ALERT", 120, 118, 5, fg);
+  printCentered("AIR QUALITY HIGH", 120, 172, 2, fg);
+
+  if (sgpState == ST_OK) snprintf(buf, sizeof(buf), "eCO2 %d ppm", co2);
+  else                   snprintf(buf, sizeof(buf), "eCO2 --");
+  printCentered(buf, 120, 198, 2, fg);
+
+  if (sgpState == ST_OK) snprintf(buf, sizeof(buf), "TVOC %d ppb", tvoc);
+  else                   snprintf(buf, sizeof(buf), "TVOC --");
+  printCentered(buf, 120, 220, 2, fg);
+
+  if (mqState == ST_OK) snprintf(buf, sizeof(buf), "CO rise %+.2f V", mqRise);
+  else                  snprintf(buf, sizeof(buf), "CO --");
+  printCentered(buf, 120, 242, 2, fg);
+
+  printCentered("Open a window / leave the area", 120, 268, 1, fg);
+  printCentered(joyOK ? "CLICK: SILENCE" : "PRESS: SILENCE", 120, 288, 2, fg);
+}
+
+// ======================================================================
+//                            Settings menu
+// ======================================================================
+void drawMenuTile(int idx) {
+  int y = (idx == 0) ? 46 : (idx == 1) ? 138 : 230;
+  int h = (idx == 2) ? 50 : 84;
+  bool sel = (menuIndex == idx);
+  uint16_t border = sel ? ST77XX_CYAN : COL_GREY;
+
+  tft.fillRect(0, y - 2, SCR_W, h + 4, ST77XX_BLACK);
+  tft.drawRoundRect(8, y, 224, h, 8, border);
+  if (sel) tft.drawRoundRect(9, y + 1, 222, h - 2, 7, border);
+
+  int cy = y + h / 2;
+  char buf[16];
+  if (idx == 0) {
+    drawChipIcon(48, cy, sel ? ST77XX_CYAN : COL_LIGHT);
+    printAt("Sensors", 92, y + 16, 2, sel ? ST77XX_CYAN : ST77XX_WHITE);
+    sensorSummary(buf, sizeof(buf));
+    uint16_t c = (sensorFaults() > 0) ? ST77XX_RED : sensorsWarming() ? ST77XX_YELLOW : ST77XX_GREEN;
+    printAt(buf, 92, y + 46, 2, c);
+  } else if (idx == 1) {
+    drawSpeaker(38, cy, 12, sel ? ST77XX_CYAN : COL_LIGHT, volume == 0);
+    printAt("Buzzer", 92, y + 16, 2, sel ? ST77XX_CYAN : ST77XX_WHITE);
+    if (volume == 0) snprintf(buf, sizeof(buf), "MUTED");
+    else snprintf(buf, sizeof(buf), "%d/10", volume);
+    printAt(buf, 92, y + 46, 2, COL_LIGHT);
+  } else {
+    printCentered("BACK", 120, y + 17, 2, sel ? ST77XX_CYAN : ST77XX_WHITE);
+  }
+}
+
+void drawSettingsMenu() {
+  char b[44];
+  tft.fillScreen(ST77XX_BLACK);
+  drawHeader("SETTINGS");
+  for (int i = 0; i < 3; i++) drawMenuTile(i);
+  if (joyOK) {
+    snprintf(b, sizeof(b), "%s/%s: select   Click: open", physName(DIR_UP), physName(DIR_DOWN));
+    printCentered(b, 120, 288, 1, COL_LIGHT);
+    snprintf(b, sizeof(b), "%s: back", physName(DIR_LEFT));
+    printCentered(b, 120, 302, 1, COL_LIGHT);
+  } else {
+    printCentered("Tap: next   Hold: open", 120, 300, 1, COL_LIGHT);
+  }
+}
+
+// ======================================================================
+//                         Buzzer settings page
+// ======================================================================
+void drawBuzzerIcon() {
+  tft.fillRect(0, 38, SCR_W, 78, ST77XX_BLACK);
+  drawSpeaker(104, 80, 24, ST77XX_CYAN, volume == 0);
+}
+
+void drawButton(int y, const char* label, bool sel, bool pressed) {
+  tft.fillRect(0, y - 2, SCR_W, 48, ST77XX_BLACK);
+  if (pressed) {
+    tft.fillRoundRect(8, y, 224, 44, 8, ST77XX_CYAN);
+  } else {
+    uint16_t border = sel ? ST77XX_CYAN : COL_GREY;
+    tft.drawRoundRect(8, y, 224, 44, 8, border);
+    if (sel) tft.drawRoundRect(9, y + 1, 222, 42, 7, border);
+  }
+  printCentered(label, 120, y + 14, 2, pressed ? ST77XX_BLACK : (sel ? ST77XX_CYAN : ST77XX_WHITE));
+}
+
+void drawBuzzerRow(int row) {
+  bool sel = (buzzRow == row);
+  if (row == 0) {
+    uint16_t border = sel ? ST77XX_CYAN : COL_GREY;
+    tft.fillRect(0, 118, SCR_W, 78, ST77XX_BLACK);
+    tft.drawRoundRect(8, 120, 224, 72, 8, border);
+    if (sel) tft.drawRoundRect(9, 121, 222, 70, 7, border);
+    tft.drawRoundRect(20, 132, 200, 22, 6, ST77XX_WHITE);
+    int fillW = (196 * volume) / 10;
+    if (fillW > 0) tft.fillRoundRect(22, 134, fillW, 18, 4, sel ? ST77XX_CYAN : ST77XX_WHITE);
+    char buf[16];
+    if (volume == 0) snprintf(buf, sizeof(buf), "MUTED");
+    else snprintf(buf, sizeof(buf), "%d/10", volume);
+    printCentered(buf, 120, 162, 3, ST77XX_WHITE);
+  } else if (row == 1) {
+    drawButton(200, "TEST SOUND", sel, false);
+  } else {
+    drawButton(252, "BACK", sel, false);
+  }
+}
+
+void drawBuzzerPage() {
+  char b[44];
+  tft.fillScreen(ST77XX_BLACK);
+  drawHeader("BUZZER");
+  drawBuzzerIcon();
+  for (int i = 0; i < 3; i++) drawBuzzerRow(i);
+  if (joyOK) {
+    snprintf(b, sizeof(b), "%s/%s: row  %s/%s: volume  Click: ok",
+             physInit(DIR_UP), physInit(DIR_DOWN), physInit(DIR_LEFT), physInit(DIR_RIGHT));
+    printCentered(b, 120, 304, 1, COL_LIGHT);
+  } else {
+    printCentered("Tap: next row   Hold: volume / select", 120, 304, 1, COL_LIGHT);
+  }
+}
+
+// TEST SOUND = 3 beeps at the volume you set (loudness check)
+void playTest() {
+  if (volume == 0) {
+    drawButton(200, "VOLUME IS 0", true, true);
+    delay(800);
+    drawBuzzerRow(1);
+    return;
+  }
+  drawButton(200, "BEEP BEEP BEEP", true, true);
+  for (int i = 0; i < 3; i++) {
+    beepMs(250);
+    delay(150);
+  }
+  drawBuzzerRow(1);
+}
+
+// Joystick mode: one volume step in the given direction (+1 / -1)
+void volumeChange(int dir) {
+  int old = volume;
+  volume = constrain(volume + dir, 0, 10);
+  if (volume == old) return;
+  drawBuzzerRow(0);
+  drawBuzzerIcon();
+  beepMs(70);                    // short sample beep at the new volume
+}
+
+// Button-only mode: one volume step while the button is held (up to 10, then back down)
+void volumeStep() {
+  if (volume >= 10) volDir = -1;
+  else if (volume <= 0) volDir = 1;
+  volume = constrain(volume + volDir, 0, 10);
+  drawBuzzerRow(0);
+  drawBuzzerIcon();
+  beepMs(70);
+  adjustLast = millis();
+}
+
+void startVolumeAdjust() {
+  volDir = -volDir;              // every new hold goes the opposite way
+  if (volume >= 10) volDir = -1;
+  if (volume <= 0)  volDir = 1;
+  adjusting = true;
+  volumeStep();
+}
+
+// ======================================================================
+//                      Display update / screen switching
+// ======================================================================
+// Mode 0 = normal page, 1 = full-screen ALERT (not silenced yet),
+// 2 = normal page flashing red (alarm silenced)
+int desiredMode() {
+  if (gasLvl < 2) return 0;
+  return alarmAcked ? 2 : 1;
+}
+
+void updateMainDisplay() {
+  if (!isMainPage(screen)) return;
+  int mode = desiredMode();
+  unsigned long now = millis();
+  bool redraw = false;
+
+  if (mode != shownMode || (mode == 0 && colorKey() != shownKey)) {
+    shownMode = mode;
+    shownKey = colorKey();
+    flashPhase = true;
+    lastFlash = now;
+    redraw = true;
+  } else if (mode != 0 && now - lastFlash >= FLASH_MS) {
+    flashPhase = !flashPhase;
+    lastFlash = now;
+    redraw = true;
+  }
+
+  if (!redraw) return;
+  if (mode == 1) drawAlertScreen(flashPhase);
+  else           drawMainPage(screen);
+}
+
+void setScreen(int s) {
+  screen = s;
+  shownMode = -1;            // force a full redraw
+  adjusting = false;
+  if (isMainPage(s))           updateMainDisplay();
+  else if (s == SETTINGS_MENU) drawSettingsMenu();
+  else if (s == STATUS_PAGE)   drawStatusPage();
+  else { buzzRow = 0; drawBuzzerPage(); }
+}
+
+// What the buzzer task should play (main pages only, not after silencing, not without valid data)
+void updateBeepMode() {
+  beepDuty = volumeDuty();
+  bool silenced = (gasLvl == 2 && alarmAcked);
+  bool enabled = isMainPage(screen) && volume > 0 && !silenced && !gasUnknown &&
+                 (gasLvl > 0 || GREEN_BEEP);
+  beepMode = enabled ? gasLvl : -1;
+}
+
+// ---------- Sensor tick (once per second) ----------
+unsigned long lastSensorTime = 0;
+unsigned long tickCount = 0;
+
+void updateSensors() {
+  unsigned long now = millis();
+  if (now - lastSensorTime < 1000) return;
+  lastSensorTime = now;
+  tickCount++;
+
+  updateSGP();                       // needs ~1 reading per second
+  updateMQ();
+  if (tickCount % 2 == 0) updateDHT();   // AM2302: at most one reading every 2 s
+  updateLevels();
+
+#if SERIAL_DEBUG
+  Serial.printf("SGP[%s] eCO2=%d TVOC=%d | MQ7[%s] pin=%.3fV noise=%.3fV AO=%.2f base=%.2f rise=%.2f | AM2302[%s] T=%.1f H=%.0f | JOY[%s] x=%d y=%d | lvl=%d unknown=%d\n",
+                stateWord((int)sgpState), co2, tvoc, stateWord((int)mqState), mqPinV, mqSpread, mqAO, mqBase, mqRise,
+                stateWord((int)dhtState), tempC, humidity, joyOK ? "AXES" : "BTN", rawXnow, rawYnow, gasLvl, gasUnknown);
+#endif
+
+  if (isMainPage(screen)) {
+    // Quiet update of the numbers (flashing modes redraw the whole page by themselves)
+    if (shownMode == 0 && colorKey() == shownKey) {
+      if (areaKeyFor(screen) != areaKey) drawMainPage(screen);   // a sensor failed or came back
+      else drawValuesFor(screen);
+    }
+  } else if (screen == STATUS_PAGE) {
+    drawStatusRows(false);
+    drawStatusSummary(false);
+  } else if (screen == SETTINGS_MENU) {
+    static int lastSumKey = -1;
+    char b[16];
+    int k = sensorSummary(b, sizeof(b));
+    if (k != lastSumKey) { lastSumKey = k; drawMenuTile(0); }
+  }
+}
+
+// ======================================================================
+//              BOOT ANIMATION: a cute little air-cloud buddy
+// ======================================================================
+//  0.0 s  bubbles float up on both sides
+//  0.6 s  the cloud pops in with a bounce
+//  1.0 s  eyes open, cheeks, tiny sprout on top
+//  1.5 s  blink, then a big happy smile, sparkles twinkle
+//  1.9 s  the title types itself and a progress bar fills
+//  2.9 s  a wink with three sparkle chimes
+const int NUM_BUBBLES = 6;
+struct Bubble { int16_t x; uint16_t delayMs; float speed; uint8_t r; };
+const Bubble BUBBLES[NUM_BUBBLES] = {
+  { 24,   0, 0.14f, 8}, {214, 120, 0.16f, 6}, { 34, 260, 0.12f, 5},
+  {204, 360, 0.15f, 9}, { 16, 450, 0.17f, 4}, {224, 520, 0.13f, 7}
+};
+const int SPARK_X[4] = {62, 178, 56, 182};
+const int SPARK_Y[4] = {58,  62, 142, 148};
+
+void drawBubble(int x, int y, int r, bool on) {
+  if (!on) { tft.fillCircle(x, y, r + 1, ST77XX_BLACK); return; }
+  tft.drawCircle(x, y, r, ST77XX_CYAN);
+  if (r >= 5) tft.fillCircle(x - r / 3, y - r / 3, 1, ST77XX_WHITE);   // little shine
+}
+
+void drawSparkle(int x, int y, bool on) {
+  if (!on) { tft.fillRect(x - 7, y - 7, 15, 15, ST77XX_BLACK); return; }
+  uint16_t c = ST77XX_YELLOW;
+  tft.drawFastHLine(x - 6, y, 13, c);
+  tft.drawFastVLine(x, y - 6, 13, c);
+  tft.drawLine(x - 3, y - 3, x + 3, y + 3, c);
+  tft.drawLine(x - 3, y + 3, x + 3, y - 3, c);
+  tft.fillCircle(x, y, 1, ST77XX_WHITE);
+}
+
+// The cloud buddy. r = body size (52 = full size). eyes: 0 open, 1 blink, 2 wink. mouth: 0 smile, 1 big smile.
+void drawCharacter(int r, bool face, int eyes, int mouth) {
+  uint16_t body  = tft.color565(210, 240, 255);
+  uint16_t pink  = tft.color565(255, 150, 170);
+  uint16_t green = tft.color565(80, 210, 110);
+  uint16_t dark  = tft.color565(25, 35, 60);
+
+  tft.fillRect(50, 24, 140, 150, ST77XX_BLACK);        // clear the character area
+  if (r <= 0) return;
+
+  // cloud body: a main circle with two puffs
+  float s = r / 52.0f;
+  tft.fillCircle(120 - (int)(38 * s), 104, (int)(28 * s), body);
+  tft.fillCircle(120 + (int)(38 * s), 104, (int)(28 * s), body);
+  tft.fillCircle(120, 105, r, body);
+
+  if (!face) return;
+
+  // sprout on top
+  tft.fillRect(119, 36, 3, 19, green);
+  tft.fillCircle(111, 38, 6, green);
+  tft.fillCircle(129, 33, 6, green);
+
+  // cheeks
+  tft.fillCircle(84, 114, 7, pink);
+  tft.fillCircle(156, 114, 7, pink);
+
+  // eyes
+  for (int e = 0; e < 2; e++) {
+    int x = (e == 0) ? 98 : 142;
+    bool closed = (eyes == 1) || (eyes == 2 && e == 1);
+    if (!closed) {
+      tft.fillCircle(x, 100, 8, dark);
+      tft.fillCircle(x + 3, 97, 3, ST77XX_WHITE);
+      tft.fillCircle(x - 3, 103, 1, ST77XX_WHITE);
+    } else if (eyes == 1) {
+      tft.fillRect(x - 8, 100, 17, 3, dark);               // blink = flat line
+    } else {
+      tft.drawCircleHelper(x, 104, 8, 3, dark);            // wink = happy arc ^
+      tft.drawCircleHelper(x, 104, 7, 3, dark);
+      tft.drawCircleHelper(x, 104, 6, 3, dark);
+    }
+  }
+
+  // mouth
+  if (mouth == 0) {
+    tft.drawCircleHelper(120, 110, 9, 0xC, dark);
+    tft.drawCircleHelper(120, 110, 10, 0xC, dark);
+    tft.drawCircleHelper(120, 110, 11, 0xC, dark);
+  } else {
+    tft.fillCircle(120, 114, 11, dark);
+    tft.fillRect(109, 103, 23, 11, body);                  // keep only the lower half = open smile
+    tft.fillCircle(120, 121, 4, pink);                     // tongue
+  }
+}
+
+void runBootAnimation() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  // sound scheduler (non-blocking, so the drawing never delays the notes)
+  int melodyIdx = 0, chimeIdx = 0;
+  bool noteOn = false;
+  unsigned long noteOffAt = 0, nextNoteAt = 0;
+
+  // animation state
+  int  prevX[NUM_BUBBLES], prevY[NUM_BUBBLES];
+  bool drawn[NUM_BUBBLES];
+  for (int i = 0; i < NUM_BUBBLES; i++) { prevX[i] = 0; prevY[i] = 0; drawn[i] = false; }
+  bool sparkOn[4] = {false, false, false, false};
+  int  lastKey = -1, typed1 = 0, typed2 = 0, barFill = 0;
+  bool barShown = false;
+  unsigned long lastFrame = 0;
+  const char* line1 = "AIR QUALITY";
+  const char* line2 = "MONITOR";
+
+  unsigned long t0 = millis();
+  for (;;) {
+    unsigned long t = millis() - t0;
+    if (t >= BOOT_ANIM_MS) break;
+
+    // ---------- sound ----------
+    if (noteOn && t >= noteOffAt) { buzzerOff(); noteOn = false; }
+    if (!noteOn && t >= nextNoteAt) {
+      if (melodyIdx < MELODY_LEN) {
+        const Note &n = MELODY[melodyIdx++];
+        if (n.f > 0 && volume > 0) { buzzerFreq(n.f); buzzerOn(volumeDuty()); noteOn = true; }
+        noteOffAt = t + n.ms;
+        nextNoteAt = t + n.ms + 12;
+      } else if (chimeIdx < CHIME_LEN && t >= CHIMES[chimeIdx].at) {
+        const Chime &c = CHIMES[chimeIdx++];
+        if (volume > 0) { buzzerFreq(c.f); buzzerOn(volumeDuty()); noteOn = true; }
+        noteOffAt = t + c.ms;
+        nextNoteAt = t + c.ms + 12;
+      }
+    }
+
+    // ---------- picture (about 33 frames per second) ----------
+    if (t - lastFrame >= 30) {
+      lastFrame = t;
+
+      // bubbles rising on both sides
+      for (int i = 0; i < NUM_BUBBLES; i++) {
+        if (drawn[i]) { drawBubble(prevX[i], prevY[i], BUBBLES[i].r, false); drawn[i] = false; }
+        if (t < BUBBLES[i].delayMs) continue;
+        float dt = (float)(t - BUBBLES[i].delayMs);
+        float y = 335.0f - BUBBLES[i].speed * dt;
+        if (y < -12.0f) continue;
+        int x = BUBBLES[i].x + (int)(sinf(dt / 170.0f + i) * 4.0f);
+        drawBubble(x, (int)y, BUBBLES[i].r, true);
+        prevX[i] = x; prevY[i] = (int)y; drawn[i] = true;
+      }
+
+      // the cloud buddy
+      int key;
+      if (t < 600)        key = 0;      // not there yet
+      else if (t < 1000)  key = 100;    // pop-in (redrawn every frame)
+      else if (t < 1500)  key = 1;      // eyes open
+      else if (t < 1600)  key = 2;      // blink
+      else if (t < 2950)  key = 3;      // big smile
+      else if (t < 3350)  key = 4;      // wink
+      else                key = 3;
+
+      bool redrawn = false;
+      if (key == 100) {
+        float q = (t - 600) / 400.0f - 1.0f;                           // ease-out-back (little overshoot)
+        float v = 1.0f + 2.70158f * q * q * q + 1.70158f * q * q;
+        drawCharacter((int)(52.0f * v), false, 0, 0);
+        lastKey = key;
+        redrawn = true;
+      } else if (key != lastKey) {
+        lastKey = key;
+        if      (key == 1) drawCharacter(52, true, 0, 0);
+        else if (key == 2) drawCharacter(52, true, 1, 0);
+        else if (key == 3) drawCharacter(52, true, 0, 1);
+        else if (key == 4) drawCharacter(52, true, 2, 1);
+        redrawn = (key != 0);
+      }
+
+      // twinkling sparkles around the buddy
+      if (redrawn) for (int i = 0; i < 4; i++) sparkOn[i] = false;     // the area was cleared
+      for (int i = 0; i < 4; i++) {
+        bool on = (t >= 1700) && ((((t - 1700) + i * 170) / 260) % 2 == 0);
+        if (on && !sparkOn[i])      drawSparkle(SPARK_X[i], SPARK_Y[i], true);
+        else if (!on && sparkOn[i]) drawSparkle(SPARK_X[i], SPARK_Y[i], false);
+        sparkOn[i] = on;
+      }
+
+      // title types itself
+      int want1 = (t < 1900) ? 0 : min(11, (int)((t - 1900) / 45) + 1);
+      while (typed1 < want1) {
+        tft.drawChar(54 + typed1 * 12, 190, line1[typed1], ST77XX_WHITE, ST77XX_BLACK, 2);
+        typed1++;
+      }
+      int want2 = (t < 2400) ? 0 : min(7, (int)((t - 2400) / 55) + 1);
+      while (typed2 < want2) {
+        tft.drawChar(78 + typed2 * 12, 212, line2[typed2], ST77XX_CYAN, ST77XX_BLACK, 2);
+        typed2++;
+      }
+
+      // progress bar
+      if (t >= 1800) {
+        if (!barShown) {
+          barShown = true;
+          tft.drawRoundRect(20, 258, 200, 12, 5, COL_LIGHT);
+          printCentered("Starting up...", 120, 278, 1, COL_LIGHT);
+        }
+        float frac = (float)(t - 1800) / (float)(BOOT_ANIM_MS - 1800);
+        if (frac > 1.0f) frac = 1.0f;
+        int w = (int)(196.0f * frac);
+        if (w > barFill) {
+          tft.fillRect(22 + barFill, 260, w - barFill, 8, ST77XX_CYAN);
+          barFill = w;
+        }
+      }
+    }
+
+    delay(1);
+  }
+
+  buzzerOff();
+  buzzerFreq(BUZZ_FREQ);        // back to the alert pitch
+  delay(150);
+}
+
+// ======================================================================
+//                         Boot sensor checkup
+// ======================================================================
+// NOTE: takes an int (not SensorState) so the Arduino auto-generated prototypes compile
+void drawCheckRow(int i, const char* name, const char* pins, int st, const char* msg) {
+  int y = 46 + i * 70;
+  tft.fillRect(0, y - 2, SCR_W, 68, ST77XX_BLACK);
+  tft.drawRoundRect(8, y, 224, 62, 8, COL_GREY);
+  printAt(name, 18, y + 8, 2, ST77XX_WHITE);
+  printAt(pins, 18, y + 30, 1, COL_LIGHT);
+
+  const char* w = "...";
+  uint16_t c = COL_LIGHT;
+  if (st == ST_OK || st == ST_WARM) { w = "OK";    c = ST77XX_GREEN; }
+  if (st == ST_FAIL)                { w = "ERROR"; c = ST77XX_RED; }
+  printRight(w, 224, y + 8, 2, c);
+
+  if (msg && msg[0]) printAt(msg, 18, y + 44, 1, st == ST_FAIL ? ST77XX_RED : COL_LIGHT);
+}
+
+void runBootCheck() {
+  char buf[40];
+
+  tft.fillScreen(ST77XX_BLACK);
+  drawHeader("SENSOR CHECK");
+  drawCheckRow(0, "SGP30",  "I2C 0x58  (SDA 21, SCL 22)", ST_CHECK, "Checking...");
+  drawCheckRow(1, "AM2302", "DATA on GPIO 13",            ST_CHECK, "");
+  drawCheckRow(2, "MQ-7",   "AO on GPIO 36 (divider)",    ST_CHECK, "");
+
+  mqWarmStart = millis();
+
+  // 1) SGP30
+  if (sgpInit()) {
+    sgpState = ST_WARM;
+    drawCheckRow(0, "SGP30", "I2C 0x58  (SDA 21, SCL 22)", ST_OK, "Found - warming up 15 s");
+  } else {
+    sgpState = ST_FAIL;
+    lastSgpRetry = millis();
+    drawCheckRow(0, "SGP30", "I2C 0x58  (SDA 21, SCL 22)", ST_FAIL, "Not found - check wiring");
+  }
+
+  // 2) AM2302 (about 1 s after power-up, then 2 s between reads)
+  drawCheckRow(1, "AM2302", "DATA on GPIO 13", ST_CHECK, "Reading...");
+  delay(1000);
+  bool ok = false;
+  for (int i = 0; i < 3 && !ok; i++) {
+    if (i > 0) delay(2100);
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    if (!isnan(h) && !isnan(t)) { ok = true; tempC = t; humidity = h; }
+  }
+  if (ok) {
+    dhtState = ST_OK;
+    snprintf(buf, sizeof(buf), "%.1f C   %.0f %% RH", tempC, humidity);
+    drawCheckRow(1, "AM2302", "DATA on GPIO 13", ST_OK, buf);
+  } else {
+    dhtState = ST_FAIL;
+    drawCheckRow(1, "AM2302", "DATA on GPIO 13", ST_FAIL, "No data - check DATA / pull-up");
+  }
+
+  // 3) MQ-7 (is there a STEADY signal on the pin?) - 6 bursts, at least 5 must be good
+  drawCheckRow(2, "MQ-7", "AO on GPIO 36 (divider)", ST_CHECK, "Reading...");
+  int good = 0;
+  for (int i = 0; i < 6; i++) {
+    readMQpin();
+    if (mqSignalGood()) good++;
+    delay(200);
+  }
+  mqAO = mqPinV * MQ7_DIVIDER;
+  mqBase = mqAO;
+  if (good >= 5) {
+    mqState = ST_WARM;
+    mqBad = 0;
+    mqOkRun = 5;
+    snprintf(buf, sizeof(buf), "AO %.2f V - warming up", mqAO);
+    drawCheckRow(2, "MQ-7", "AO on GPIO 36 (divider)", ST_OK, buf);
+  } else {
+    mqState = ST_FAIL;
+    mqBad = 4;
+    mqOkRun = 0;
+    drawCheckRow(2, "MQ-7", "AO on GPIO 36 (divider)", ST_FAIL, "No stable signal - check AO / VP");
+  }
+
+  // Summary
+  int n = sensorFaults();
+  tft.fillRect(0, 256, SCR_W, 64, ST77XX_BLACK);
+  if (n == 0) {
+    printCentered("ALL SENSORS OK", 120, 258, 2, ST77XX_GREEN);
+  } else {
+    snprintf(buf, sizeof(buf), "%d NOT WORKING", n);
+    printCentered(buf, 120, 258, 2, ST77XX_RED);
+  }
+  printCentered(joyInfo, 120, 280, 1, joyOK ? COL_LIGHT : ST77XX_YELLOW);   // joystick check result
+  printCentered("Starting...", 120, 298, 1, COL_LIGHT);
+  if (n > 0) {
+    for (int i = 0; i < 3; i++) { beepMs(120); delay(120); }   // warning beeps
+  }
+  delay(2200);
+}
+
+// ======================================================================
+//                      Input handling: JOYSTICK mode
+// ======================================================================
+// dir = logical DIR_* (after the remap), click = button tap or hold
+void handleJoystickInput(int dir, bool click) {
+  // ----- main pages -----
+  if (isMainPage(screen)) {
+    if (gasLvl == 2 && !alarmAcked) {      // RED alarm: only the button silences it
+      if (click) alarmAcked = true;        // (the page keeps flashing red)
+      return;
+    }
+    if (dir == DIR_RIGHT)      setScreen((screen + 1) % NUM_MAIN);
+    else if (dir == DIR_LEFT)  setScreen((screen + NUM_MAIN - 1) % NUM_MAIN);
+    else if (click) {
+      returnPage = screen;
+      menuIndex = 0;
+      setScreen(SETTINGS_MENU);
+    }
+    return;
+  }
+
+  // ----- settings menu -----
+  if (screen == SETTINGS_MENU) {
+    if (dir == DIR_UP || dir == DIR_DOWN) {
+      int old = menuIndex;
+      menuIndex = (menuIndex + (dir == DIR_DOWN ? 1 : 2)) % 3;
+      drawMenuTile(old);
+      drawMenuTile(menuIndex);
+    } else if (dir == DIR_LEFT) {
+      setScreen(returnPage);
+    } else if (click) {
+      if (menuIndex == 0)      setScreen(STATUS_PAGE);
+      else if (menuIndex == 1) setScreen(BUZZER_PAGE);
+      else                     setScreen(returnPage);
+    }
+    return;
+  }
+
+  // ----- sensor status page -----
+  if (screen == STATUS_PAGE) {
+    if (click || dir == DIR_LEFT) setScreen(SETTINGS_MENU);
+    return;
+  }
+
+  // ----- buzzer page -----
+  if (dir == DIR_UP || dir == DIR_DOWN) {
+    int old = buzzRow;
+    buzzRow = (buzzRow + (dir == DIR_DOWN ? 1 : 2)) % 3;
+    drawBuzzerRow(old);
+    drawBuzzerRow(buzzRow);
+  } else if ((dir == DIR_LEFT || dir == DIR_RIGHT) && buzzRow == 0) {
+    volumeChange(dir == DIR_RIGHT ? 1 : -1);
+  } else if (click) {
+    if (buzzRow == 0) {
+      beepMs(150);                         // sample beep at the current volume
+    } else if (buzzRow == 1) {
+      playTest();
+    } else {
+      saveSettings();
+      setScreen(SETTINGS_MENU);
+    }
+  }
+}
+
+// ======================================================================
+//                    Input handling: BUTTON-ONLY mode
+// ======================================================================
+void handleButtonOnly(int ev) {
+  // ----- main pages -----
+  if (isMainPage(screen)) {
+    if (gasLvl == 2 && !alarmAcked) {      // RED alarm: silence buzzer + ALERT notification
+      alarmAcked = true;                   // (the page keeps flashing red)
+      return;
+    }
+    if (ev == BTN_TAP) {
+      setScreen((screen + 1) % NUM_MAIN);  // next page
+    } else {                               // HOLD = open settings
+      returnPage = screen;
+      menuIndex = 0;
+      setScreen(SETTINGS_MENU);
+    }
+    return;
+  }
+
+  // ----- settings menu -----
+  if (screen == SETTINGS_MENU) {
+    if (ev == BTN_TAP) {                   // next row
+      int old = menuIndex;
+      menuIndex = (menuIndex + 1) % 3;
+      drawMenuTile(old);
+      drawMenuTile(menuIndex);
+    } else {                               // HOLD = open
+      if (menuIndex == 0)      setScreen(STATUS_PAGE);
+      else if (menuIndex == 1) setScreen(BUZZER_PAGE);
+      else                     setScreen(returnPage);
+    }
+    return;
+  }
+
+  // ----- sensor status page -----
+  if (screen == STATUS_PAGE) {
+    setScreen(SETTINGS_MENU);              // tap or hold = back
+    return;
+  }
+
+  // ----- buzzer page -----
+  if (ev == BTN_TAP) {                     // next row
+    int old = buzzRow;
+    buzzRow = (buzzRow + 1) % 3;
+    drawBuzzerRow(old);
+    drawBuzzerRow(buzzRow);
+  } else {                                 // HOLD = act on the selected row
+    if (buzzRow == 0) {
+      startVolumeAdjust();                 // volume keeps changing while the button is held
+    } else if (buzzRow == 1) {
+      playTest();
+    } else {
+      saveSettings();
+      setScreen(SETTINGS_MENU);
+    }
+  }
+}
+
+// ======================================================================
+//                              Setup / Loop
+// ======================================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(SW_PIN, INPUT_PULLUP);
+
+  loadSettings();
+  pwmBegin();
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(MQ7_PIN, ADC_11db);   // measure up to about 3.3 V
+  analogSetPinAttenuation(JOY_X, ADC_11db);
+  analogSetPinAttenuation(JOY_Y, ADC_11db);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  dht.begin();
+
+  calibrateJoystick();       // do not touch the joystick while booting
+
+  tft.init(240, 320);        // if blank/garbled, try: tft.init(240, 320, SPI_MODE3);
+  tft.setRotation(2);        // portrait. Use 0 if it appears upside down
+  tft.fillScreen(ST77XX_BLACK);
+
+  runBootAnimation();        // cute boot animation + startup music
+  runBootCheck();            // checks every sensor and shows the result
+
+  updateLevels();
+  xTaskCreatePinnedToCore(buzzerTask, "buzzer", 2048, NULL, 2, NULL, 0);
+
+  lastInput = millis();
+  lastSensorTime = millis();
+  setScreen(PAGE_GAS);
+}
+
+void loop() {
+  int ev = readButton();
+
+  if (joyOK) {
+    // Joystick mode: axes navigate, the button clicks. Holding left/right repeats on the volume row.
+    bool click = (ev != BTN_NONE);
+    int dir = readDirection(screen == BUZZER_PAGE && buzzRow == 0);
+    if (dir != DIR_NONE || click) {
+      lastInput = millis();
+      handleJoystickInput(dir, click);
+    }
+  } else {
+    // Button-only mode
+    if (ev != BTN_NONE) {
+      lastInput = millis();
+      handleButtonOnly(ev);
+    }
+    // Hold-to-change volume: keeps changing while the button is held, stops on release
+    if (adjusting) {
+      lastInput = millis();
+      if (!btnDown) {
+        adjusting = false;
+        saveSettings();
+        drawBuzzerRow(0);
+      } else if (millis() - adjustLast >= VOL_STEP_MS) {
+        volumeStep();
+      }
+    }
+  }
+
+  updateSensors();
+  if (gasLvl < 2) alarmAcked = false;   // a new RED alarm will beep again
+  updateMainDisplay();
+  updateBeepMode();
+
+  // Leave the settings screens after 30 s without input so alerts are never missed
+  if (!isMainPage(screen) && millis() - lastInput > 30000UL) {
+    adjusting = false;
+    saveSettings();
+    setScreen(returnPage);
+  }
+
+  delay(5);
+}
