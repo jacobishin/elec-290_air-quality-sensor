@@ -391,6 +391,8 @@ void initializeAlerts() {
 
 // The first like 20 readings for sgp30 are like inaccurate
 
+//for the mq7, a reading can only be taken like every 2.5 seconds
+
 /// @brief sensors are read into the rawData struct, and then fed into accumulateData()
 ///        to obtain an average for the raw data. 
 /// @param rawData 
