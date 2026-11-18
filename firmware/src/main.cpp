@@ -29,7 +29,8 @@ LCD
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 
-#include "tests.h" // Testing helper functions
+#include "local_communication.h" // Display, Joystick, and Buzzer module
+#include "tests.h"               // Testing helper functions
 
 
 // ============================================================
@@ -116,11 +117,12 @@ const int allowedStaleReadings = NULL;
 const int allowedStorageFaults = NULL;
 const int allowedWifiFaults = NULL;
 
-typedef enum faultenum {NONE, SENSOR, STORAGE, INVALID, STALE, WIFI} faultenum;
 
 // ============================================================
 /* DATA STRUCTURES */
 // ============================================================
+// Note: ProcessedData, AverageData, FaultStatus, and faultenum are 
+// included via "local_communication.h" so all .cpp files share the same types.
 
 // Raw sensor data structure
 struct SensorReading {
@@ -173,57 +175,6 @@ struct SensorAccumulators {
   SensorTotal pm25UGM3;
 };
 
-// Processed data structs
-// Finalized 60-second and 5-second window
-struct AverageData {
-  float average = NAN;
-  float maximum = NAN;
-  unsigned int sampleCount = 0;
-  bool valid = false;
-};
-
-struct ProcessedData {
-  unsigned long windowEndTimestamp = 0;
-  AverageData coPPM;
-  AverageData tvocPPB;
-  AverageData eco2PPM;
-  AverageData temperatureC;
-  AverageData humidityPercent;
-  AverageData pm25UGM3;
-};
-
-struct SensorFault {
-  bool status = false;
-  int num = 0;
-};
-
-struct InvalidReading {
-  bool status = false;
-  int num = 0;
-};
-
-struct StaleReading {
-  bool status = false;
-  int num = 0;
-};
-
-struct StorageFault {
-  bool status = false;
-  int num = 0;
-};
-
-struct WifiFault {
-  bool status = false;
-  int num = 0;
-};
-
-struct FaultStatus {
-  struct SensorFault sensor;
-  struct InvalidReading readingInvalid;
-  struct StaleReading readingStale;
-  struct StorageFault storage;
-  struct WifiFault wifi;
-};
 
 // ============================================================
 /* GLOBAL VARIABLES */
@@ -243,10 +194,9 @@ bool wifiConnected        = false;
 bool dangerAlertActive    = false;
 String activeAlertMessage = "Normal";
 
-// Hardware instances
+// Hardware instances (ST7789 lcd instance is managed inside local_communication.cpp)
 Adafruit_SGP30 sgp;
 DHT dht(DHT_PIN, DHT22);
-Adafruit_ST7789 lcd = Adafruit_ST7789(SCREEN_CS_PIN, SCREEN_DC_PIN, I2C_SDA_SCREEN_PIN, I2C_SCL_SCREEN_PIN, SCREEN_RST_PIN);
 
 // byte offset for last cloud upload in csv file
 Preferences syncPrefs;
@@ -295,6 +245,7 @@ int faultDetections(faultenum fault, bool override);
 
 
 // Decision logic
+void updateAlerts();
 
 
 // Data Storage
@@ -307,6 +258,7 @@ void storeData(const ProcessedData &data);
 bool csvLineToJson(const String &csvLine, String &jsonOut);
 bool sendJsonToFirebase(const String &jsonPayload);
 void updateCommunication(unsigned long currentTime);
+void updateDisplay(const ProcessedData &data);
 void transmitData();
 void checkWiFiConnection();
 
@@ -325,7 +277,6 @@ void setup() {
 /* MAIN LOOP */
 // ============================================================
 void loop() {
-  
   unsigned long currentTime = millis();
 
   // Data acquisitiion
@@ -333,8 +284,10 @@ void loop() {
   // data processing and fault detection
 
   // Decision logic
+  updateAlerts();
 
   // Communicaton
+  updateCommunication(currentTime);
 
   // Data storage
 
@@ -373,18 +326,7 @@ void initializeSensors() {
 }
 
 void initializeDisplay() {
-  Serial.println("Initializing LCD display and Joystick...");
-  pinMode(JOY_X_PIN, INPUT);
-  pinMode(JOY_Y_PIN, INPUT);
-  pinMode(JOY_SW_PIN, INPUT_PULLUP);
-
-  lcd.init(240, 320);
-  lcd.setRotation(1);
-  lcd.fillScreen(ST77XX_BLACK);
-  lcd.setCursor(0, 0);
-  lcd.setTextColor(ST77XX_WHITE);
-  lcd.setTextSize(2);
-  lcd.print("Gas Monitor Init");
+  initDisplayAndJoystickHardware();
 }
 
 void initializeStorage() {
@@ -439,8 +381,7 @@ void initializeCommunication() {
 }
 
 void initializeAlerts() {
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  initBuzzerHardware();
 }
 
 
@@ -749,6 +690,11 @@ int faultDetections(faultenum fault, bool override){
 /* DECISION LOGIC */
 // ============================================================
 
+// updates the buzzer state (pulsing alarm when dangerAlertActive is true, or muted via joystick click)
+void updateAlerts() {
+  refreshBuzzerState(millis());
+}
+
 
 // ============================================================
 // 5. DATA STORAGE
@@ -910,17 +856,20 @@ bool sendJsonToFirebase(const String &jsonPayload) {
   return (code >= 200 && code < 300);
 }
 
-// triggers transmitData() every 2 seconds whenever wi-fi is connected
+// polls the joystick for responsive navigation and triggers transmitData() every 2 seconds whenever wi-fi is connected
 void updateCommunication(unsigned long currentTime) {
+  handleJoystickInput(currentTime, displayData);
+
   if (wifiConnected && (currentTime - lastTransmission >= TRANSMIT_INTERVAL)) {
     lastTransmission = currentTime;
     transmitData();
   }
 }
 
-// updates the LCD screen with wi-fi status and alerts on line 0
-// ADD CODE HERE
-
+// updates the 2.0" ST7789 LCD screen
+void updateDisplay(const ProcessedData &data) {
+  renderDisplay(data);
+}
 
 // reads the next unsent row from the active CSV log file, converts it to JSON, and uploads it to Firebase
 void transmitData() {
