@@ -28,6 +28,12 @@
 <body>
 <h1>Air Quality Monitor</h1>
 
+<nav>
+  <button id="tab-readings" class="active">My device</button>
+  <button id="tab-map">Public map</button>
+</nav>
+
+<section id="view-readings">
 <!-- Logged out -->
 <div id="login-section">
   <input id="device-id" placeholder="Device ID (e.g. monitor-01)">
@@ -40,25 +46,22 @@
 <!-- Logged in -->
 <div id="app" hidden>
   <p>Device: <b id="device-label"></b> <button id="logout-btn">Log out</button></p>
-  <nav>
-    <button id="tab-readings" class="active">Readings</button>
-    <button id="tab-map">Map</button>
-  </nav>
-
-  <section id="view-readings">
-    <button id="add-test-btn">Add test reading</button>
+  <button id="add-test-btn">Add test reading</button>
     <div id="latest"></div>
     <h2>Recent readings</h2>
     <div class="scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
-  </section>
+</div>
+</section>
 
-  <section id="view-map" hidden>
-    <p>Click the map to drop a pin, type the place name, then publish your latest reading. Published readings are visible to everyone.</p>
-    <div id="map"></div>
+<section id="view-map" hidden>
+  <p>Readings published by users. No login needed to view.</p>
+  <div id="map"></div>
+  <div id="publish-box" hidden>
+    <p>To add yours: click the map to drop a pin, type the place name, then publish your latest reading.</p>
     <input id="place" placeholder="Place name (e.g. Stauffer Library)">
     <button id="publish-btn">Publish latest reading here</button>
-  </section>
-</div>
+  </div>
+</section>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script type="module">
@@ -67,7 +70,6 @@ import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, si
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import { getFirestore, collection, doc, setDoc, addDoc, query, orderBy, limit, onSnapshot, Timestamp }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-
 
 const firebaseConfig = {
   apiKey: "AIzaSyCInYadRTEuNcRaPqeYl7qe-p3b5zSzplI",
@@ -78,14 +80,15 @@ const firebaseConfig = {
   appId: "1:1041203123160:web:6a371b01318ea9ad9998ad"
 };
 
-
+// EDIT THIS LIST to match the gases your sensors measure.
+// "base" is only used to make fake test readings.
 const GASES = [
   { key: "CO",   label: "Carbon monoxide",  unit: "ppm",   base: 1 },
   { key: "CO2",  label: "Carbon dioxide",   unit: "ppm",   base: 420 },
   { key: "VOC",  label: "VOCs",             unit: "ppb",   base: 50 },
   { key: "PM25", label: "PM2.5",            unit: "ug/m3", base: 8 }
 ];
-const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", F: "#c62828" };
+const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", E: "#c62828" };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -108,6 +111,8 @@ function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 let deviceId = null, latest = null, unsub = null, registering = false;
 let map = null, pin = null, markers = null;
 
+// ---------- Login: the device ID is the username ----------
+// Firebase logins need an email, so we turn the device ID into a fake one.
 const idToEmail = (id) => id + "@monitor.example";
 
 function readId() {
@@ -152,6 +157,7 @@ function showLogin() {
   latest = null;
   $("login-section").hidden = false;
   $("app").hidden = true;
+  $("publish-box").hidden = true;
 }
 
 function showApp(user) {
@@ -159,6 +165,7 @@ function showApp(user) {
   $("device-label").textContent = deviceId;
   $("login-section").hidden = true;
   $("app").hidden = false;
+  $("publish-box").hidden = false;
   $("message").textContent = "";
   if (unsub) unsub();
   // Readings live under the device: devices/<id>/readings
@@ -171,7 +178,7 @@ function showApp(user) {
   }, (err) => alert("Could not read: " + err.message));
 }
 
-// Readings tab 
+// ---------- Readings tab ----------
 function renderLatest() {
   const box = $("latest");
   box.replaceChildren();
@@ -218,7 +225,7 @@ $("add-test-btn").onclick = async () => {
   } catch (e) { alert("Could not save: " + e.message); }
 };
 
-// Tabs
+// ---------- Tabs ----------
 function openTab(name) {
   $("view-readings").hidden = name !== "readings";
   $("view-map").hidden = name !== "map";
@@ -229,7 +236,7 @@ function openTab(name) {
 $("tab-readings").onclick = () => openTab("readings");
 $("tab-map").onclick = () => openTab("map");
 
-// Map tab (public)
+// ---------- Map tab (public) ----------
 function popupFor(r) {
   const d = el("div");
   d.append(el("b", r.place), el("br"), gradeBadge(r.grade), el("br"), el("small", fmtTime(r.timestamp)));
@@ -247,6 +254,7 @@ function initMap() {
     { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
   markers = L.layerGroup().addTo(map);
   map.on("click", (e) => {
+    if (!auth.currentUser) return;
     if (pin) pin.setLatLng(e.latlng);
     else pin = L.circleMarker(e.latlng, { radius: 8, color: "#000", weight: 3, fill: false }).addTo(map);
   });
