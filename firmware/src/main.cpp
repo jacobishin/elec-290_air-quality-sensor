@@ -30,7 +30,7 @@ LCD
 #include <Adafruit_ST7789.h>
 
 #include "local_communication.h" // Display, Joystick, and Buzzer module
-#include "tests.h"               // Testing helper functions
+#include "tests.h" // Testing helper functions
 
 
 // ============================================================
