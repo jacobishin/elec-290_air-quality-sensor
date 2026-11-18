@@ -101,6 +101,8 @@ const int allowedStaleReadings = NULL;
 const int allowedStorageFaults = NULL;
 const int allowedWifiFaults = NULL;
 
+typedef enum faultenum {NONE, SENSOR, STORAGE, INVALID, STALE, WIFI}faultenum;
+
 // ============================================================
 /* DATA STRUCTURES */
 // ============================================================
@@ -349,7 +351,8 @@ void initializeStorage() {
   Serial.println("Initializing LittleFS and NVS storage...");
   if (!LittleFS.begin(true)) {
     Serial.println("ERROR: LittleFS mount failed!");
-    faults.storage.num++;
+    
+    faultDetections(STORAGE, false);
     //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
     return;
   }
@@ -364,20 +367,26 @@ void initializeStorage() {
   if (!LittleFS.exists(activePath)) {
     if (initNewLogFile(activeLogFileIndex)) {
       Serial.printf("Created %s and set offset past header.\n", activePath);
-    }
-    return;
-  }
+    } else {
 
-  File logFile = LittleFS.open(activePath, "r");
-  if (logFile) {
-    currentLogFileSize = logFile.size();
-    logFile.close();
-    if (lastUploadedByteOffset > currentLogFileSize) {
-      lastUploadedByteOffset = 0;
-      syncPrefs.putUInt("upload_offset", 0);
+      //this is CAUSING a fault
+      faultDetections(STORAGE, false);
+      //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
+      return;
+    }
+  } else {
+    File logFile = LittleFS.open(activePath, "r");
+    if (logFile) {
+      size_t currentSize = logFile.size();
+      logFile.close();
+      if (lastUploadedByteOffset > currentSize) {
+        lastUploadedByteOffset = 0;
+        syncPrefs.putUInt("upload_offset", 0);
+      }
     }
   }
-  faults.storage.num++;
+  //this is CAUSING a fault
+  faultDetections(STORAGE, false);
   //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
 }
 
@@ -416,6 +425,8 @@ void readSensors(){
     
 
     if (!sgp.IAQmeasure()){ //IAQmeasure return value is a bool
+      faults.readingInvalid.num++;
+      faultDetections(STORAGE, false);
       throw ("SGP30 reading returned false");
     }
     rawData.sgp30.eco2PPM.value = sgp.eCO2; //i think this is in ppm
@@ -444,6 +455,12 @@ void readSensors(){
   
 }
 
+/// @brief reads in data from each sensor, storing as a float, then adds the value to
+///        its appropriate accumulator. If it is the highest that was seen, in the 
+///        last period, also update the maximum value.
+
+///        This is simply reading in values and accumulating it into categories.
+///        processData will have the average values that get displayed and stored
 void accumulateData(){
   //safetyAccumulators is for 5 second display update
   //accumulators is for 60 second file write
@@ -613,36 +630,82 @@ int processData(bool option){
     //maybe call updatedisplay?
 }
 
-int faultDetections(){
+/// @brief Increases the number of faults, and determines if faults should be updated 
+///        and displayed on the LCD.
+/// @return 
+int faultDetections(faultenum fault, bool override){
   /*
-    For faults: store an amount of faults during the given frame before uploading data, and if that 
-    frame contains a set number of errors, then cause a fault to occur.
-    if faults are detected:
-    listOfFaults->sensorFault = true;
-    listOfFaults->invalidReading = true;
-    listOfFaults-> staleReading = true;
-    listOfFaults-> storageFault = false;
-    listOfFaults->wifiFault = false;
+    EVERY time a fault is reported, this should be called to log that a fault has happened.
+    Storage has a requirement of 1 report -> it is going to be a true fault if any storage error occurs
+    Wifi will simply show that it is not connected to wifi - intentionally or unintentionally
+    Sensors should display errors whenever it has an issue, but is only a 'true fault' after so many
+        --> This meaning readingInvalid or readingStale.
+        --> Actual sensor issues are like storage, sensor.status = true persisting until it connects 
+  
+    overrideFault resets the fault display once connection has been established/issue addressed.
+    if 0, do not override any.
+    else, follow enum guide
+      
   */
-  if (faults.sensor.num >= allowedSensorFaults){
-    //do smthn
-  }
+ if (fault == SENSOR){
+    faults.sensor.num++;
+    if (faults.sensor.num >= allowedSensorFaults){
+      faults.sensor.status = true;
+    }
+    if (override){
+      faults.sensor.num = 0;
+      faults.sensor.status = false;  
+    }  
+    //update LCD
+ }
 
-  if (faults.readingInvalid.num >= allowedInvalidReadings){
-    //do smthn
-  }
+ if (fault == INVALID){
+    faults.readingInvalid.num++;
+    if (faults.readingInvalid.num >= allowedInvalidReadings){
+      faults.readingInvalid.status = true;
+    }
+    if (override){
+      faults.readingInvalid.num = 0;
+      faults.readingInvalid.status = false;  
+    }  
+    //update LCD
+ }
 
-  if (faults.readingStale.num >= allowedInvalidReadings){
-    //do smthn
-  }
+ if (fault == STALE){
+    faults.readingStale.num++;
+    if (faults.readingStale.num >= allowedStaleReadings){
+      faults.readingStale.status = true;
+    }
+    if (override){
+      faults.readingStale.num = 0;
+      faults.readingStale.status = false;  
+    }  
+    //update LCD
+ }
 
-  if (faults.storage.num >= allowedInvalidReadings){
-    //do smthn
-  }
-
-  if (faults.wifi.num >= allowedWifiFaults){
-    //do smthn
-  }
+ if (fault == STORAGE){
+    faults.storage.num++;
+    if (faults.storage.num >= allowedStorageFaults){
+      faults.storage.status = true;
+    }
+    if (override){
+      faults.storage.num = 0;
+      faults.storage.status = false;  
+    }  
+    //update LCD
+ }
+ 
+ if (fault == WIFI){
+    faults.wifi.num++;
+    if (faults.wifi.num >= allowedWifiFaults){
+      faults.wifi.status = true;
+    }
+    if (override){
+      faults.wifi.num = 0;
+      faults.wifi.status = false;  
+    }  
+    //update LCD
+ }
 }
 // ============================================================
 /* DECISION LOGIC */
