@@ -389,6 +389,8 @@ void initializeAlerts() {
 /* DATA ACQUISITION */
 // ============================================================
 
+// The first like 20 readings for sgp30 are like inaccurate
+
 /// @brief sensors are read into the rawData struct, and then fed into accumulateData()
 ///        to obtain an average for the raw data. 
 /// @param rawData 
