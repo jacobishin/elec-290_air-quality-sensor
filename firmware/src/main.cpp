@@ -76,12 +76,12 @@ const char* LOG_FILE_2_PATH    = "/sensor_log_2.csv";
 const size_t MAX_LOG_FILE_SIZE = 100000;
 
 const char* CSV_HEADER = "timestamp_ms,alert_active,"
-                         "co_avg,co_max,co_count,co_valid,"
-                         "tvoc_avg,tvoc_max,tvoc_count,tvoc_valid,"
-                         "eco2_avg,eco2_max,eco2_count,eco2_valid,"
-                         "temp_avg,temp_max,temp_count,temp_valid,"
-                         "hum_avg,hum_max,hum_count,hum_valid,"
-                         "pm25_avg,pm25_max,pm25_count,pm25_valid";
+                         "co_avg,co_count,co_valid,"
+                         "tvoc_avg,tvoc_count,tvoc_valid,"
+                         "eco2_avg,eco2_count,eco2_valid,"
+                         "temp_avg,temp_count,temp_valid,"
+                         "hum_avg,hum_count,hum_valid,"
+                         "pm25_avg,pm25_count,pm25_valid";
 
 
 // Air quality thresholds
@@ -326,11 +326,27 @@ void initializeSystem() {
   Serial.println("Initialization complete."); // for debug purposes
 }
 
-void initializeSensors(){}
-void initializeDisplay(){}
+void initializeSensors() {
+  Serial.println("Initializing sensor pins and buses...");
+  pinMode(MQ7_PIN, INPUT);
+  analogReadResolution(12);
 
-void initializeStorage(){
-  Serial.println("Initializing storage..."); // for debug purposes
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  dht.begin();
+
+  Serial2.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
+}
+
+void initializeDisplay() {
+  Serial.println("Initializing LCD display...");
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Gas Monitor Init");
+}
+
+void initializeStorage() {
+  Serial.println("Initializing LittleFS and NVS storage...");
   if (!LittleFS.begin(true)) {
     Serial.println("ERROR: LittleFS mount failed!");
     faults.storage.num++;
@@ -341,55 +357,45 @@ void initializeStorage(){
   syncPrefs.begin("gas_sync", false);
 
   activeLogFileIndex = syncPrefs.getUChar("active_file", 1);
-  if (activeLogFileIndex != 1 && activeLogFileIndex != 2) {
-    activeLogFileIndex = 1;
-    syncPrefs.putUChar("active_file", 1);
-  }
+  if (activeLogFileIndex != 1 && activeLogFileIndex != 2) activeLogFileIndex = 1;
   lastUploadedByteOffset = syncPrefs.getUInt("upload_offset", 0);
 
-  // const char* activePath = getActiveLogFilePath();
-
+  const char* activePath = getLogFilePath();
   if (!LittleFS.exists(activePath)) {
-    File logFile = LittleFS.open(activePath, "w");
-    if (logFile) {
-      logFile.println(CSV_HEADER);
-      lastUploadedByteOffset = logFile.size(); // Skip header row
-      logFile.close();
-      syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+    if (initNewLogFile(activeLogFileIndex)) {
       Serial.printf("Created %s and set offset past header.\n", activePath);
-    } else {
-      faults.storage.num++;
-      //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
-      return;
     }
-  } else {
-    File logFile = LittleFS.open(activePath, "r");
-    if (logFile) {
-      size_t currentSize = logFile.size();
-      logFile.close();
-      if (lastUploadedByteOffset > currentSize) {
-        lastUploadedByteOffset = 0;
-        syncPrefs.putUInt("upload_offset", 0);
-      }
-    }
+    return;
   }
 
+  File logFile = LittleFS.open(activePath, "r");
+  if (logFile) {
+    currentLogFileSize = logFile.size();
+    logFile.close();
+    if (lastUploadedByteOffset > currentLogFileSize) {
+      lastUploadedByteOffset = 0;
+      syncPrefs.putUInt("upload_offset", 0);
+    }
+  }
   faults.storage.num++;
   //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
 }
 
-void initializeCommunication(){
+void initializeCommunication() {
   Serial.println("Initializing communication...");
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true); // automatically set the modem to sleep to conserve battery life
-  WiFi.setAutoReconnect(true); // make wi-fi auto reconnect if it drops off
+  WiFi.setSleep(true);         // Automatic Modem-Sleep to conserve battery
+  WiFi.setAutoReconnect(true); // Non-blocking background reconnect
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   // Configure background NTP time synchronization (UTC / Unix Epoch)
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 }
 
-void initializeAlerts(){}
+void initializeAlerts() {
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+}
 
 
 // ============================================================
@@ -652,7 +658,7 @@ int faultDetections(){
 // memory from filling up, it alternates between two 100 KB csv files. before 
 // writing a new row, it checks if the current file is full, and if it is, it 
 // wipes the other file, writes the csv headers, and switches over to logging there.
-//
+
 // it also keeps track of which file is active and the exact byte position of the 
 // last row uploaded to firebase using NVS preferences, so it knows where to pick 
 // back up after a reboot. while the device is offline, it just logs the time in 
@@ -660,6 +666,151 @@ int faultDetections(){
 // it goes back through the active csv file and updates those boot timestamps to 
 // real unix timestamps. there are also serial commands ('D' and 'R') so you can 
 // dump the active csv file to the serial monitor or wipe the logs to reset everything.
+
+
+// Function for retrieving either the active or inactive file
+const char* getLogFilePath(bool active) {
+  return ((activeLogFileIndex == 1) == active) ? LOG_FILE_1_PATH : LOG_FILE_2_PATH;
+}
+
+// creates or overwrites a log file with the CSV header, updates the cached file size, and the state information to NVS
+bool initNewLogFile(uint8_t fileIndex) {
+  activeLogFileIndex = fileIndex;
+  File f = LittleFS.open(getLogFilePath(), "w");
+  if (!f) return !(faults.storage.num++);
+
+  f.println(CSV_HEADER);
+  currentLogFileSize = lastUploadedByteOffset = f.size();
+  f.close();
+
+  syncPrefs.putUChar("active_file", activeLogFileIndex);
+  syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+  return !(faults.storage.num++);
+}
+
+// returns the real world unix timestamp in seconds if NTP has synced, and if online, it returns seconds since boot
+unsigned long getTimestampForLogging(unsigned long currentMillis) {
+  time_t now = time(nullptr);
+  return (now > 1700000000) ? static_cast<unsigned long>(now) : (currentMillis / 1000);
+}
+
+// goes through the active csv file after NTP syncs and converts any relative boot timestamps into real unix timestamps
+void fillLocalTimestamps(unsigned long calculatedBootEpoch) {
+  const char* activePath = getLogFilePath();
+  File inFile = LittleFS.open(activePath, "r");
+  if (!inFile) return;
+
+  // open a temporary file where the updated rows will be written as the function parses the active file
+  const char* tempPath = "/temp.csv";
+  File outFile = LittleFS.open(tempPath, "w");
+  if (!outFile) {
+    inFile.close();
+    return;
+  }
+
+  size_t newUploadOffset = 0;
+  bool offsetLocked      = false;
+
+  // read the active csv file, line by line
+  while (inFile.available()) {
+    size_t lineStartPos = inFile.position();
+    String line = inFile.readStringUntil('\n');
+    line.trim();
+    if (line.isEmpty()) continue;
+
+    // if we reach the byte position where firebase uploads left off, record the matching position in the new file
+    if (!offsetLocked && lineStartPos >= lastUploadedByteOffset) {
+      newUploadOffset = outFile.position();
+      offsetLocked    = true;
+    }
+
+    // get the timestamp, and if it's a relative timee (< 1700000000), add bootEpochSec to make it real unix time
+    unsigned long rowTime = strtoul(line.c_str(), nullptr, 10);
+    int comma = line.indexOf(',');
+    if (!line.startsWith("timestamp_s") && comma > 0 && rowTime < 1700000000UL) {
+      outFile.printf("%lu%s\r\n", calculatedBootEpoch + rowTime, line.c_str() + comma);
+    } else {
+      outFile.println(line);
+    }
+  }
+
+  // update our cached file size and upload offset, then replace the old csv file with the temp file
+  faults.storage.num++ = outFile.position();
+  if (!offsetLocked) newUploadOffset = currentLogFileSize;
+  inFile.close();
+  outFile.close();
+
+  LittleFS.remove(activePath);
+  LittleFS.rename(tempPath, activePath);
+
+  lastUploadedByteOffset = newUploadOffset;
+  syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+  Serial.println("Updated local timestamps with real unix time");
+}
+
+// formats the 60-second processed sensor data into a CSV row, rotates files if full, and appends it to flash
+void storeData(const ProcessedData &data) {
+  if (faults.storage.num++)) return;
+
+  // start building the csv row with the timestamp and whether an alert is active
+  char csvRow[256];
+  int pos = snprintf(csvRow, sizeof(csvRow), "%lu,%d",
+                     getTimestampForLogging(data.windowEndTimestamp),
+                     dangerAlertActive ? 1 : 0);
+
+  // loop through all 6 sensor summaries in ProcessedData and append their avg, max, count, and valid flag
+  const AverageData* m = &data.coPPM;
+  for (int i = 0; i < 6; i++) {
+    pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
+                    (m[i].valid && isfinite(m[i].average) && isfinite(m[i].maximum))
+                        ? ",%.2f,%.2f,%u,1"
+                        : ",NAN,NAN,%u,%d",
+                    m[i].average, m[i].maximum, m[i].sampleCount, m[i].valid ? 1 : 0);
+  }
+
+  // if adding a new row owuld make the file too big, wipe it and switch over the other log file.
+  if (currentLogFileSize + pos + 2 > MAX_LOG_FILE_SIZE) {
+    if (!initNewLogFile((activeLogFileIndex == 1) ? 2 : 1)) return;
+    Serial.printf("Switched active log to %s.\n", getLogFilePath());
+  }
+
+  // open the active log file in append mode, write the new csv row, and update the cached file size
+  File logFile = LittleFS.open(getLogFilePath(), "a");
+  if (!logFile) {
+    faults.storage.num++;
+    return;
+  }
+
+  size_t written = logFile.println(csvRow);
+  currentLogFileSize = logFile.size();
+  logFile.close();
+  faults.storage.num++;
+}
+
+// checks the serial monitor for 'D' (to dump the active CSV file) or 'R' (to wipe both files and reset NVS)
+void handleSerialStorageCommands() {
+  if (!Serial.available()) return;
+  char cmd = Serial.read() | 0x20; // Convert uppercase to lowercase
+
+  // 'd' prints every line of the current active csv file to the serial monitor
+  if (cmd == 'd') {
+    Serial.printf("\n--- DUMPING %s ---\n", getLogFilePath());
+    File f = LittleFS.open(getLogFilePath(), "r");
+    if (f) {
+      while (f.available()) Serial.write(f.read());
+      f.close();
+    }
+    Serial.println("--- END OF FILE ---\n");
+  } 
+  // 'r' deletes both csv files from flash and resets the active file back to file 1
+  else if (cmd == 'r') {
+    LittleFS.remove(LOG_FILE_1_PATH);
+    LittleFS.remove(LOG_FILE_2_PATH);
+    initNewLogFile(1);
+    Serial.println("Cleared both log files and reset NVS state.");
+  }
+}
+
 
 // ============================================================
 // 6. COMMUNICATION
