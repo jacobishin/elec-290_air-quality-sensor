@@ -27,6 +27,8 @@ LCD
 #include <DHT.h>
 #include <LiquidCrystal_I2C.h> // not sure if this is the right library
 
+#include "tests.h" // Testing helper functions
+
 
 // ============================================================
 /* CONFIGURATION */
@@ -101,7 +103,7 @@ const int allowedStaleReadings = NULL;
 const int allowedStorageFaults = NULL;
 const int allowedWifiFaults = NULL;
 
-typedef enum faultenum {NONE, SENSOR, STORAGE, INVALID, STALE, WIFI}faultenum;
+typedef enum faultenum {NONE, SENSOR, STORAGE, INVALID, STALE, WIFI} faultenum;
 
 // ============================================================
 /* DATA STRUCTURES */
@@ -177,14 +179,6 @@ struct ProcessedData {
   AverageData pm25UGM3;
 };
 
-struct FaultStatus {
-  struct SensorFault sensor;
-  struct InvalidReading readingInvalid;
-  struct StaleReading readingStale;
-  struct StorageFault storage;
-  struct WifiFault wifi;
-};
-
 struct SensorFault {
   bool status = false;
   int num = 0;
@@ -208,6 +202,14 @@ struct StorageFault {
 struct WifiFault {
   bool status = false;
   int num = 0;
+};
+
+struct FaultStatus {
+  struct SensorFault sensor;
+  struct InvalidReading readingInvalid;
+  struct StaleReading readingStale;
+  struct StorageFault storage;
+  struct WifiFault wifi;
 };
 
 // ============================================================
@@ -237,6 +239,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 Preferences syncPrefs;
 uint8_t activeLogFileIndex    = 1;
 size_t lastUploadedByteOffset = 0;
+size_t currentLogFileSize     = 0;
 bool timeSyncedThisBoot       = false;
 unsigned long bootEpochSec    = 0;
 
@@ -263,7 +266,6 @@ void initializeCommunication();
 void initializeAlerts();
 
 // Data acquisition
-void readSensors(unsigned long currentTime);
 void acquireMQ7(unsigned long currentTime);
 void acquireSGP30(unsigned long currentTime);
 void acquireTempHumidity(unsigned long currentTime);
@@ -282,10 +284,17 @@ void acquirePM25(unsigned long currentTime);
 
 
 // Data Storage
-const char getActiveLogFilePath();
+const char* getLogFilePath(bool active = true);
+bool initNewLogFile(uint8_t fileIndex);
+void storeData(const ProcessedData &data);
 
 
 // Communication
+bool csvLineToJson(const String &csvLine, String &jsonOut);
+bool sendJsonToFirebase(const String &jsonPayload);
+void updateCommunication(unsigned long currentTime);
+void transmitData();
+void checkWiFiConnection();
 
 
 // ============================================================
@@ -295,7 +304,7 @@ const char getActiveLogFilePath();
 void setup() {
   Serial.begin(115200);
   initializeSystem();
-  Serial.println("Harmful Gas Monitor Started\n");
+  Serial.println("Harmful Gas Monitor Started (Type 'H' for test commands)\n");
 }
 
 // ============================================================
@@ -312,6 +321,8 @@ void loop() {
 
     // Data storage
 
+    // Testing commands (from tests.cpp)
+    runTestCommands();
 }
 
 // ============================================================
@@ -336,6 +347,11 @@ void initializeSensors() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   dht.begin();
 
+  if (!sgp.begin()) {
+    Serial.println("WARNING: SGP30 sensor not found on I2C!");
+    faultDetections(SENSOR, false);
+  }
+
   Serial2.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
 }
 
@@ -351,9 +367,7 @@ void initializeStorage() {
   Serial.println("Initializing LittleFS and NVS storage...");
   if (!LittleFS.begin(true)) {
     Serial.println("ERROR: LittleFS mount failed!");
-    
     faultDetections(STORAGE, false);
-    //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
     return;
   }
 
@@ -368,26 +382,25 @@ void initializeStorage() {
     if (initNewLogFile(activeLogFileIndex)) {
       Serial.printf("Created %s and set offset past header.\n", activePath);
     } else {
-
-      //this is CAUSING a fault
       faultDetections(STORAGE, false);
-      //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
       return;
     }
   } else {
     File logFile = LittleFS.open(activePath, "r");
     if (logFile) {
-      size_t currentSize = logFile.size();
+      currentLogFileSize = logFile.size();
       logFile.close();
-      if (lastUploadedByteOffset > currentSize) {
+      if (lastUploadedByteOffset > currentLogFileSize) {
         lastUploadedByteOffset = 0;
         syncPrefs.putUInt("upload_offset", 0);
       }
+    } else {
+      faultDetections(STORAGE, false);
+      return;
     }
   }
-  //this is CAUSING a fault
-  faultDetections(STORAGE, false);
-  //!!!!!!!!!!!!!!!!!!!!!!call for fault checking (when function is made)
+
+  faultDetections(STORAGE, true);
 }
 
 void initializeCommunication() {
@@ -707,6 +720,7 @@ int faultDetections(faultenum fault, bool override){
     //update LCD
  }
 }
+
 // ============================================================
 /* DECISION LOGIC */
 // ============================================================
@@ -721,26 +735,26 @@ int faultDetections(faultenum fault, bool override){
 // memory from filling up, it alternates between two 100 KB csv files. before 
 // writing a new row, it checks if the current file is full, and if it is, it 
 // wipes the other file, writes the csv headers, and switches over to logging there.
-
+//
 // it also keeps track of which file is active and the exact byte position of the 
 // last row uploaded to firebase using NVS preferences, so it knows where to pick 
 // back up after a reboot. while the device is offline, it just logs the time in 
-// seconds since boot, then once wi-fi connects and gets the real time from NTP, 
-// it goes back through the active csv file and updates those boot timestamps to 
-// real unix timestamps. there are also serial commands ('D' and 'R') so you can 
-// dump the active csv file to the serial monitor or wipe the logs to reset everything.
+// seconds since boot, and when the rows get uploaded to firebase later, any relative 
+// boot timestamps get converted to real unix timestamps on the fly.
 
-
-// Function for retrieving either the active or inactive file
+// returns the file path for the active log file (when active is true) or the inactive file (when false)
 const char* getLogFilePath(bool active) {
   return ((activeLogFileIndex == 1) == active) ? LOG_FILE_1_PATH : LOG_FILE_2_PATH;
 }
 
-// creates or overwrites a log file with the CSV header, updates the cached file size, and the state information to NVS
+// creates or overwrites a log file with the CSV header, updates the cached file size, and saves state to NVS
 bool initNewLogFile(uint8_t fileIndex) {
   activeLogFileIndex = fileIndex;
   File f = LittleFS.open(getLogFilePath(), "w");
-  if (!f) return !(faults.storage.num++);
+  if (!f) {
+    faultDetections(STORAGE, false);
+    return false;
+  }
 
   f.println(CSV_HEADER);
   currentLogFileSize = lastUploadedByteOffset = f.size();
@@ -748,90 +762,33 @@ bool initNewLogFile(uint8_t fileIndex) {
 
   syncPrefs.putUChar("active_file", activeLogFileIndex);
   syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
-  return !(faults.storage.num++);
+  faultDetections(STORAGE, true);
+  return true;
 }
 
-// returns the real world unix timestamp in seconds if NTP has synced, and if online, it returns seconds since boot
-unsigned long getTimestampForLogging(unsigned long currentMillis) {
-  time_t now = time(nullptr);
-  return (now > 1700000000) ? static_cast<unsigned long>(now) : (currentMillis / 1000);
-}
-
-// goes through the active csv file after NTP syncs and converts any relative boot timestamps into real unix timestamps
-void fillLocalTimestamps(unsigned long calculatedBootEpoch) {
-  const char* activePath = getLogFilePath();
-  File inFile = LittleFS.open(activePath, "r");
-  if (!inFile) return;
-
-  // open a temporary file where the updated rows will be written as the function parses the active file
-  const char* tempPath = "/temp.csv";
-  File outFile = LittleFS.open(tempPath, "w");
-  if (!outFile) {
-    inFile.close();
-    return;
-  }
-
-  size_t newUploadOffset = 0;
-  bool offsetLocked      = false;
-
-  // read the active csv file, line by line
-  while (inFile.available()) {
-    size_t lineStartPos = inFile.position();
-    String line = inFile.readStringUntil('\n');
-    line.trim();
-    if (line.isEmpty()) continue;
-
-    // if we reach the byte position where firebase uploads left off, record the matching position in the new file
-    if (!offsetLocked && lineStartPos >= lastUploadedByteOffset) {
-      newUploadOffset = outFile.position();
-      offsetLocked    = true;
-    }
-
-    // get the timestamp, and if it's a relative timee (< 1700000000), add bootEpochSec to make it real unix time
-    unsigned long rowTime = strtoul(line.c_str(), nullptr, 10);
-    int comma = line.indexOf(',');
-    if (!line.startsWith("timestamp_s") && comma > 0 && rowTime < 1700000000UL) {
-      outFile.printf("%lu%s\r\n", calculatedBootEpoch + rowTime, line.c_str() + comma);
-    } else {
-      outFile.println(line);
-    }
-  }
-
-  // update our cached file size and upload offset, then replace the old csv file with the temp file
-  faults.storage.num++ = outFile.position();
-  if (!offsetLocked) newUploadOffset = currentLogFileSize;
-  inFile.close();
-  outFile.close();
-
-  LittleFS.remove(activePath);
-  LittleFS.rename(tempPath, activePath);
-
-  lastUploadedByteOffset = newUploadOffset;
-  syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
-  Serial.println("Updated local timestamps with real unix time");
-}
-
-// formats the 60-second processed sensor data into a CSV row, rotates files if full, and appends it to flash
+// formats the 60-second processed sensor data (avg, count, valid) into a CSV row, rotates files if full, and appends it to flash
 void storeData(const ProcessedData &data) {
-  if (faults.storage.num++)) return;
+  if (faults.storage.status) return;
+
+  // use real unix time if NTP has synced (> 1700000000), otherwise log relative seconds since boot
+  time_t now = time(nullptr);
+  unsigned long timestampSec = (now > 1700000000) ? static_cast<unsigned long>(now) : (data.windowEndTimestamp / 1000);
 
   // start building the csv row with the timestamp and whether an alert is active
   char csvRow[256];
-  int pos = snprintf(csvRow, sizeof(csvRow), "%lu,%d",
-                     getTimestampForLogging(data.windowEndTimestamp),
-                     dangerAlertActive ? 1 : 0);
+  int pos = snprintf(csvRow, sizeof(csvRow), "%lu,%d", timestampSec, dangerAlertActive ? 1 : 0);
 
-  // loop through all 6 sensor summaries in ProcessedData and append their avg, max, count, and valid flag
+  // loop through all 6 sensor summaries in ProcessedData and append their avg, count, and valid flag (no max)
   const AverageData* m = &data.coPPM;
   for (int i = 0; i < 6; i++) {
     pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
-                    (m[i].valid && isfinite(m[i].average) && isfinite(m[i].maximum))
-                        ? ",%.2f,%.2f,%u,1"
-                        : ",NAN,NAN,%u,%d",
-                    m[i].average, m[i].maximum, m[i].sampleCount, m[i].valid ? 1 : 0);
+                    (m[i].valid && isfinite(m[i].average))
+                        ? ",%.2f,%u,1"
+                        : ",NAN,%u,%d",
+                    m[i].average, m[i].sampleCount, m[i].valid ? 1 : 0);
   }
 
-  // if adding a new row owuld make the file too big, wipe it and switch over the other log file.
+  // if adding a new row would make the file too big, wipe the other file and switch over to it
   if (currentLogFileSize + pos + 2 > MAX_LOG_FILE_SIZE) {
     if (!initNewLogFile((activeLogFileIndex == 1) ? 2 : 1)) return;
     Serial.printf("Switched active log to %s.\n", getLogFilePath());
@@ -840,37 +797,15 @@ void storeData(const ProcessedData &data) {
   // open the active log file in append mode, write the new csv row, and update the cached file size
   File logFile = LittleFS.open(getLogFilePath(), "a");
   if (!logFile) {
-    faults.storage.num++;
+    faultDetections(STORAGE, false);
     return;
   }
 
   size_t written = logFile.println(csvRow);
   currentLogFileSize = logFile.size();
   logFile.close();
-  faults.storage.num++;
-}
-
-// checks the serial monitor for 'D' (to dump the active CSV file) or 'R' (to wipe both files and reset NVS)
-void handleSerialStorageCommands() {
-  if (!Serial.available()) return;
-  char cmd = Serial.read() | 0x20; // Convert uppercase to lowercase
-
-  // 'd' prints every line of the current active csv file to the serial monitor
-  if (cmd == 'd') {
-    Serial.printf("\n--- DUMPING %s ---\n", getLogFilePath());
-    File f = LittleFS.open(getLogFilePath(), "r");
-    if (f) {
-      while (f.available()) Serial.write(f.read());
-      f.close();
-    }
-    Serial.println("--- END OF FILE ---\n");
-  } 
-  // 'r' deletes both csv files from flash and resets the active file back to file 1
-  else if (cmd == 'r') {
-    LittleFS.remove(LOG_FILE_1_PATH);
-    LittleFS.remove(LOG_FILE_2_PATH);
-    initNewLogFile(1);
-    Serial.println("Cleared both log files and reset NVS state.");
+  if (written < (size_t)pos) {
+    faultDetections(STORAGE, false);
   }
 }
 
@@ -887,10 +822,114 @@ void handleSerialStorageCommands() {
 //
 // instead of sending live sensor readings straight to the cloud, it reads unsent 
 // rows directly from the local csv file every 2 seconds when wi-fi is connected. 
-// it converts each csv row into a json format (turning any NAN values into null) 
-// and sends it to firebase, only moving the saved upload bookmark forward once 
-// firebase confirms it received the data. wi-fi modem-sleep and auto-reconnect are 
-// also turned on here to help save battery life.
+// it converts each csv row into a json format (turning any NAN values into null and 
+// converting any offline boot timestamps into real unix time) and sends it to firebase, 
+// only moving the saved upload bookmark forward once firebase confirms it received the data.
+
+// takes a single 20-column comma-separated row from the CSV file and converts it into a nested JSON string for Firebase
+bool csvLineToJson(const String &csvLine, String &jsonOut) {
+  if (csvLine.startsWith("timestamp_")) return false;
+
+  // copy the csv line into a temporary char buffer and split it at every comma into 20 tokens
+  char buf[256];
+  strncpy(buf, csvLine.c_str(), sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  char* tok[20];
+  int n = 0;
+  for (char* p = strtok(buf, ","); p && n < 20; p = strtok(nullptr, ",")) tok[n++] = p;
+  if (n < 20) return false;
+
+  // if the row was logged offline using seconds since boot (< 1700000000) and NTP is now synced, convert it to up-to-date unix time
+  unsigned long ts = strtoul(tok[0], nullptr, 10);
+  if (ts < 1700000000UL && bootEpochSec > 0) {
+    ts += bootEpochSec;
+  }
+
+  // write the timestamp and alert status at the start of the json
+  const char* keys[6] = {"co", "tvoc", "eco2", "temp", "hum", "pm25"};
+  char jsonBuf[512];
+  int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu,\"alert_active\":%s", ts, tok[1]);
+
+  // loop through the 6 sensors (3 tokens each: avg, count, valid) and format them into json
+  for (int i = 0; i < 6; i++) {
+    int b = 2 + (i * 3);
+    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
+                    ",\"%s\":{\"avg\":%s,\"count\":%s,\"valid\":%s}",
+                    keys[i],
+                    strcmp(tok[b], "NAN") ? tok[b] : "null",
+                    tok[b + 1], tok[b + 2]);
+  }
+  snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "}");
+  jsonOut = jsonBuf;
+  return true;
+}
+
+// sends the formatted JSON string to the Firebase Realtime Database over HTTPS POST and returns true if accepted
+bool sendJsonToFirebase(const String &jsonPayload) {
+  if (strlen(FIREBASE_URL) == 0) {
+    Serial.println("Sent to firebase:" + jsonPayload);
+    return true;
+  }
+
+  static WiFiClientSecure client;
+  client.setInsecure(); // Skip root CA verification for  simplicity
+
+  HTTPClient http;
+  http.setReuse(true);
+  String fullUrl = String(FIREBASE_URL) + (strlen(FIREBASE_AUTH_TOKEN) ? ("?auth=" + String(FIREBASE_AUTH_TOKEN)) : "");
+  if (!http.begin(client, fullUrl)) return false;
+
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(jsonPayload);
+  http.end();
+  return (code >= 200 && code < 300);
+}
+
+// triggers transmitData() every 2 seconds whenever wi-fi is connected
+void updateCommunication(unsigned long currentTime) {
+  if (wifiConnected && (currentTime - lastTransmission >= TRANSMIT_INTERVAL)) {
+    lastTransmission = currentTime;
+    transmitData();
+  }
+}
+
+// updates the LCD screen with wi-fi status and alerts on line 0
+// ADD CODE HERE
 
 
+// reads the next unsent row from the active CSV log file, converts it to JSON, and uploads it to Firebase
+void transmitData() {
+  if (faults.storage.status || !wifiConnected || lastUploadedByteOffset >= currentLogFileSize) return;
 
+  File logFile = LittleFS.open(getLogFilePath(), "r");
+  if (!logFile) return;
+
+  logFile.seek(lastUploadedByteOffset);
+  String line = logFile.readStringUntil('\n');
+  line.trim();
+  size_t nextOffset = logFile.position();
+  logFile.close();
+
+  String jsonPayload;
+  if (line.isEmpty() || !csvLineToJson(line, jsonPayload) || sendJsonToFirebase(jsonPayload)) {
+    lastUploadedByteOffset = nextOffset;
+    syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+  }
+}
+
+// checks if wi-fi is connected and calculates the boot epoch time the first time NTP gets real time
+void checkWiFiConnection() {
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  faultDetections(WIFI, wifiConnected);
+
+  // the first time wi-fi connects and the NTP clock gets a valid unix timestamp (> 1700000000),
+  // calculate the exact unix time when the esp32 booted so offline timestamps can be converted on upload
+  if (wifiConnected && !timeSyncedThisBoot) {
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+      timeSyncedThisBoot = true;
+      bootEpochSec       = static_cast<unsigned long>(now) - (millis() / 1000);
+    }
+  }
+}

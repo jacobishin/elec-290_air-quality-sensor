@@ -35,3 +35,11 @@ Read more about using header files in official GCC documentation:
 * Computed Includes
 
 https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+
+Available Serial Monitor Commands (115200 baud):
+  'D' - Dump the active LittleFS CSV file to Serial Monitor (RTM R5)
+  'R' - Reset/wipe both CSV log files and reset NVS upload offset
+  'S' - Print current storage & cloud sync status (file, size, offset)
+  'P' - Print the 60-second sensor summary, alert status, and fault counts
+  'F' - Inject a simulated storage fault to test fault handling (RTM R8)
+  'C' - Clear all active fault flags and counters
