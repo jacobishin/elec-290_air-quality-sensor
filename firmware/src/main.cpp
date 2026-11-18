@@ -72,8 +72,8 @@ const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
 
 // Sensor sampling intervals
 const unsigned long MQ7_SAMPLE_INTERVAL = 1000;
-const unsigned long CCS811_SAMPLE_INTERVAL = 1000;
-const unsigned long TEMPHUM_SAMPLE_INTERVAL = 1000;
+const unsigned long SGP30_SAMPLE_INTERVAL = 1000;
+const unsigned long TEMPHUM_SAMPLE_INTERVAL = 2000;
 const unsigned long PM25_SAMPLE_INTERVAL = 1000;
 
 // Stale reading multiplier (stale reading timeout = sample interval * multiplier)
