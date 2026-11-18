@@ -23,9 +23,11 @@ LCD
 #include <Preferences.h>
 
 #include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_SGP30.h>
 #include <DHT.h>
-#include <LiquidCrystal_I2C.h> // not sure if this is the right library
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
 
 #include "tests.h" // Testing helper functions
 
@@ -41,20 +43,31 @@ const char* WIFI_PASSWORD = "WIFI_PASSWORD";
 const char* FIREBASE_URL =""; // idk if itll be a url or an endpoint
 const char* FIREBASE_AUTH_TOKEN = ""; // idk if actual authentication is necessary
 
-// Pin assignments
-const int I2C_SDA_PIN = NULL;
-const int I2C_SCL_PIN = NULL;
+// Pin assignments (ESP32 GPIO numbers from schematic U1)
+const int I2C_SDA_SGP30_PIN  = 21; // IO21 (Schematic physical pin 33)
+const int I2C_SCL_SGP30_PIN  = 22; // IO22 (Schematic physical pin 36)
 
-const int PMS_RX_PIN = NULL;
-const int PMS_TX_PIN = NULL;
+const int I2C_SDA_SCREEN_PIN = 23; // IO23 (Schematic physical pin 37 - SDA/MOSI on CN1)
+const int I2C_SCL_SCREEN_PIN = 18; // IO18 (Schematic physical pin 30 - SCL/SCK on CN1)
+const int SCREEN_CS_PIN      = 5;  // IO5  (Schematic physical pin 29 - CS on CN1)
+const int SCREEN_DC_PIN      = 27; // IO27 (Schematic physical pin 12 - DC on CN1)
+const int SCREEN_RST_PIN     = 26; // IO26 (Schematic physical pin 11 - RST on CN1)
+
+// Joystick pins (H3)
+const int JOY_X_PIN  = 34; // IO34 (Schematic physical pin 6 - VRx)
+const int JOY_Y_PIN  = 35; // IO35 (Schematic physical pin 7 - VRy)
+const int JOY_SW_PIN = 32; // IO32 (Schematic physical pin 8 - SW)
+
+const int PMS_RX_PIN = 33; // IO33 (Schematic physical pin 9 - RX)
+const int PMS_TX_PIN = 19; // IO19 (Schematic physical pin 31 - TX)
 
 //sensor pins
-const int MQ7_PIN  = NULL;
-const int DHT_PIN = NULL;
-const int SGP30_PIN = NULL;
-const int PM25_PIN = NULL;
+const int MQ7_PIN   = 36; // SENSOR_VP / IO36 (Schematic physical pin 4 - AO)
+const int DHT_PIN   = 13; // IO13 (Schematic physical pin 16 - OUT)
+const int SGP30_PIN = 21; // Uses I2C (IO21 / IO22)
+const int PM25_PIN  = 33; // Uses UART2 (IO33 / IO19)
 
-const int BUZZER_PIN = NULL;
+const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
 
 // Sensor sampling intervals
 const unsigned long MQ7_SAMPLE_INTERVAL = 1000;
@@ -233,7 +246,7 @@ String activeAlertMessage = "Normal";
 // Hardware instances
 Adafruit_SGP30 sgp;
 DHT dht(DHT_PIN, DHT22);
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+Adafruit_ST7789 lcd = Adafruit_ST7789(SCREEN_CS_PIN, SCREEN_DC_PIN, I2C_SDA_SCREEN_PIN, I2C_SCL_SCREEN_PIN, SCREEN_RST_PIN);
 
 // byte offset for last cloud upload in csv file
 Preferences syncPrefs;
@@ -278,6 +291,7 @@ void acquirePM25(unsigned long currentTime);
 // then take the average of 60 seconds and save and upload it every 60 seconds. each sensor has 
 // its own sampling interval. for the average readings every 5 seconds, 
 // it should remove the highest and lowest reading, then take the average of whats left
+int faultDetections(faultenum fault, bool override);
 
 
 // Decision logic
@@ -311,18 +325,21 @@ void setup() {
 /* MAIN LOOP */
 // ============================================================
 void loop() {
-    // Data acquisitiion
+  
+  unsigned long currentTime = millis();
 
-    // data processing and fault detection
+  // Data acquisitiion
 
-    // Decision logic
+  // data processing and fault detection
 
-    // Communicaton
+  // Decision logic
 
-    // Data storage
+  // Communicaton
 
-    // Testing commands (from tests.cpp)
-    runTestCommands();
+  // Data storage
+
+  // Testing commands (from tests.cpp)
+  runTestCommands();
 }
 
 // ============================================================
@@ -344,7 +361,7 @@ void initializeSensors() {
   pinMode(MQ7_PIN, INPUT);
   analogReadResolution(12);
 
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.begin(I2C_SDA_SGP30_PIN, I2C_SCL_SGP30_PIN);
   dht.begin();
 
   if (!sgp.begin()) {
@@ -356,10 +373,17 @@ void initializeSensors() {
 }
 
 void initializeDisplay() {
-  Serial.println("Initializing LCD display...");
-  lcd.init();
-  lcd.backlight();
+  Serial.println("Initializing LCD display and Joystick...");
+  pinMode(JOY_X_PIN, INPUT);
+  pinMode(JOY_Y_PIN, INPUT);
+  pinMode(JOY_SW_PIN, INPUT_PULLUP);
+
+  lcd.init(240, 320);
+  lcd.setRotation(1);
+  lcd.fillScreen(ST77XX_BLACK);
   lcd.setCursor(0, 0);
+  lcd.setTextColor(ST77XX_WHITE);
+  lcd.setTextSize(2);
   lcd.print("Gas Monitor Init");
 }
 
