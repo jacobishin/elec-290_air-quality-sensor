@@ -1,43 +1,11 @@
 #include "tests.h"
+#include "local_communication.h"
 #include <LittleFS.h>
 #include <Preferences.h>
 
 // ============================================================
 // FROM MAIN.CPP
 // ============================================================
-typedef enum faultenum {NONE, SENSOR, STORAGE, INVALID, STALE, WIFI} faultenum;
-
-struct AverageData {
-  float average = NAN;
-  float maximum = NAN;
-  unsigned int sampleCount = 0;
-  bool valid = false;
-};
-
-struct ProcessedData {
-  unsigned long windowEndTimestamp = 0;
-  AverageData coPPM;
-  AverageData tvocPPB;
-  AverageData eco2PPM;
-  AverageData temperatureC;
-  AverageData humidityPercent;
-  AverageData pm25UGM3;
-};
-
-struct SensorFault     { bool status = false; int num = 0; };
-struct InvalidReading  { bool status = false; int num = 0; };
-struct StaleReading    { bool status = false; int num = 0; };
-struct StorageFault    { bool status = false; int num = 0; };
-struct WifiFault       { bool status = false; int num = 0; };
-
-struct FaultStatus {
-  struct SensorFault sensor;
-  struct InvalidReading readingInvalid;
-  struct StaleReading readingStale;
-  struct StorageFault storage;
-  struct WifiFault wifi;
-};
-
 extern const char* LOG_FILE_1_PATH;
 extern const char* LOG_FILE_2_PATH;
 extern uint8_t activeLogFileIndex;
@@ -57,7 +25,7 @@ extern int faultDetections(faultenum fault, bool override);
 // TESTING & DEBUG FUNCTIONS
 // ============================================================
 
-// Prints every line of CSV file on flash to the Serial Monitor
+// Prints every line of active CSV file on flash to the Serial Monitor
 void dumpActiveLogFile() {
   const char* path = getLogFilePath(true);
   Serial.printf("\n--- DUMPING ACTIVE LOG: %s (%u bytes) ---\n", path, (unsigned int)currentLogFileSize);
@@ -95,7 +63,7 @@ void printStorageSyncStatus() {
   Serial.println("-----------------------------\n");
 }
 
-// Prints a summary of the 60-second sensor averages, alert status, and fault counts to the serial monitor
+// Prints a summary of the 60-second sensor averages, alert status, and fault counts to the Serial Monitor
 void printDebugInformation() {
   Serial.println();
   Serial.printf("===== 60s WINDOW SUMMARY (Active File: %s) =====\n", getLogFilePath(true));

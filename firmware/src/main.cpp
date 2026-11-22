@@ -5,7 +5,7 @@ Hardware:
 ESP32-WROVER
 SGP30 - eCO2 and TVOC sensor
 MQ-7 - CO sensor
-DHT11 - temp and humid sensor
+DHT22 - temp and humid sensor
 PMS7003 - pm2.5 sensor
 Buzzer
 LCD
@@ -30,7 +30,7 @@ LCD
 #include <Adafruit_ST7789.h>
 
 #include "local_communication.h" // Display, Joystick, and Buzzer module
-#include "tests.h" // Testing helper functions
+#include "tests.h"               // Testing helper functions
 
 
 // ============================================================
@@ -72,8 +72,8 @@ const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
 
 // Sensor sampling intervals
 const unsigned long MQ7_SAMPLE_INTERVAL = 1000;
-const unsigned long SGP30_SAMPLE_INTERVAL = 1000;
-const unsigned long TEMPHUM_SAMPLE_INTERVAL = 2000;
+const unsigned long CCS811_SAMPLE_INTERVAL = 1000;
+const unsigned long TEMPHUM_SAMPLE_INTERVAL = 1000;
 const unsigned long PM25_SAMPLE_INTERVAL = 1000;
 
 // Stale reading multiplier (stale reading timeout = sample interval * multiplier)
@@ -270,7 +270,9 @@ void checkWiFiConnection();
 void setup() {
   Serial.begin(115200);
   initializeSystem();
-  Serial.println("Harmful Gas Monitor Started (Type 'H' for test commands)\n");
+  checkWiFiConnection();
+  updateDisplay(displayData);
+  Serial.println("Harmful Gas Monitor Started.\n");
 }
 
 // ============================================================
@@ -279,19 +281,31 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
 
-  // Data acquisitiion
+  // --- Section 2: Data Acquisition ---
+  // (Teammates: call readSensors() / accumulateData() on sensor intervals here)
 
-  // data processing and fault detection
+  // --- Section 3 & 4: 5-Second Display & Wi-Fi Window ---
+  if (currentTime - lastDisplayAndUI >= DISPLAY_INTERVAL) {
+    lastDisplayAndUI = currentTime;
+    // (Teammates: call processData(false) and evaluateAirQuality() here)
+    checkWiFiConnection();
+    updateDisplay(displayData);
+  }
 
-  // Decision logic
+  // --- Section 3 & 5: 60-Second Storage Window ---
+  if (currentTime - lastWindowClose >= LOG_INTERVAL) {
+    lastWindowClose = currentTime;
+    // (Teammates: call processData(true) here)
+    storeData(loggedData);
+  }
+
+  // --- Section 4: Decision Logic (Buzzer) ---
   updateAlerts();
 
-  // Communicaton
+  // --- Section 6: Communication (Joystick, Alert Flashing, Firebase Upload) ---
   updateCommunication(currentTime);
 
-  // Data storage
-
-  // Testing commands (from tests.cpp)
+  // --- Testing Commands (tests.cpp) ---
   runTestCommands();
 }
 
@@ -313,6 +327,7 @@ void initializeSensors() {
   Serial.println("Initializing sensor pins and buses...");
   pinMode(MQ7_PIN, INPUT);
   analogReadResolution(12);
+  analogSetPinAttenuation(MQ7_PIN, ADC_11db);
 
   Wire.begin(I2C_SDA_SGP30_PIN, I2C_SCL_SGP30_PIN);
   dht.begin();
@@ -388,10 +403,6 @@ void initializeAlerts() {
 // ============================================================
 /* DATA ACQUISITION */
 // ============================================================
-
-// The first like 20 readings for sgp30 are like inaccurate
-
-//for the mq7, a reading can only be taken like every 2.5 seconds
 
 /// @brief sensors are read into the rawData struct, and then fed into accumulateData()
 ///        to obtain an average for the raw data. 
@@ -787,20 +798,8 @@ void storeData(const ProcessedData &data) {
 // ============================================================
 // 6. COMMUNICATION
 // ============================================================
-// the communication section handles everything to do with sending information to 
-// the user and the cloud, so this includes updating the lcd, managing the wi-fi 
-// connection, uploading logs to firebase, and printing debug info to the serial 
-// monitor. every 5 seconds, it checks the wi-fi status and refreshes the lcd to 
-// show whether wi-fi is connected or disconnected, any active gas alerts or sensor 
-// faults, and the 5-second trimmed averages for CO and TVOC.
-//
-// instead of sending live sensor readings straight to the cloud, it reads unsent 
-// rows directly from the local csv file every 2 seconds when wi-fi is connected. 
-// it converts each csv row into a json format (turning any NAN values into null and 
-// converting any offline boot timestamps into real unix time) and sends it to firebase, 
-// only moving the saved upload bookmark forward once firebase confirms it received the data.
 
-// takes a single 20-column comma-separated row from the CSV file and converts it into a nested JSON string for Firebase
+// takes a single 20-column comma-separated row from the CSV file and converts it into JSON for Firebase
 bool csvLineToJson(const String &csvLine, String &jsonOut) {
   if (csvLine.startsWith("timestamp_")) return false;
 
@@ -820,12 +819,12 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
     ts += bootEpochSec;
   }
 
-  // write the timestamp and alert status at the start of the json
+  // write the timestamp at the start of the json (tok[1] / alert_active is intentionally omitted)
   const char* keys[6] = {"co", "tvoc", "eco2", "temp", "hum", "pm25"};
   char jsonBuf[512];
-  int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu,\"alert_active\":%s", ts, tok[1]);
+  int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu", ts);
 
-  // loop through the 6 sensors (3 tokens each: avg, count, valid) and format them into json
+  // ORIGINAL: Nested JSON (subfields: avg, count, valid)
   for (int i = 0; i < 6; i++) {
     int b = 2 + (i * 3);
     pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
@@ -834,6 +833,19 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
                     strcmp(tok[b], "NAN") ? tok[b] : "null",
                     tok[b + 1], tok[b + 2]);
   }
+
+  /*
+  // Backup: no subfields
+  for (int i = 0; i < 6; i++) {
+    int b = 2 + (i * 3);
+    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
+                    ",\"%s_avg\":%s,\"%s_count\":%s,\"%s_valid\":%s",
+                    keys[i], strcmp(tok[b], "NAN") ? tok[b] : "null",
+                    keys[i], tok[b + 1],
+                    keys[i], tok[b + 2]);
+  }
+  */
+
   snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "}");
   jsonOut = jsonBuf;
   return true;
@@ -847,7 +859,7 @@ bool sendJsonToFirebase(const String &jsonPayload) {
   }
 
   static WiFiClientSecure client;
-  client.setInsecure(); // Skip root CA verification for  simplicity
+  client.setInsecure(); // Skip root CA verification for simplicity
 
   HTTPClient http;
   http.setReuse(true);
