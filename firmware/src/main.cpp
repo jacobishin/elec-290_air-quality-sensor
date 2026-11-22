@@ -44,7 +44,7 @@ LCD
 const char* WIFI_SSID = "jacob";
 const char* WIFI_PASSWORD = "341145100";
 
-const char* FIREBASE_URL ="https://"; // idk if itll be a url or an endpoint
+const char* FIREBASE_URL =""; // idk if itll be a url or an endpoint
 const char* FIREBASE_AUTH_TOKEN = ""; // idk if actual authentication is necessary
 
 // Pin assignments (ESP32 GPIO numbers from schematic U1)
