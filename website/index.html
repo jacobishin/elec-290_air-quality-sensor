@@ -20,6 +20,7 @@
   .gas small { color: #52646a; }
   table { border-collapse: collapse; width: 100%; background: #fff; font-size: .9rem; }
   th, td { border: 1px solid #cfd8d6; padding: 5px 8px; text-align: left; }
+  td.summary {min-width: 180px; max-width: 280px; white-space: normal; }
   .scroll { overflow-x: auto; }
   #map { height: 380px; border: 1px solid #cfd8d6; margin: 8px 0; }
   #message { color: #b00020; }
@@ -88,7 +89,7 @@ const GASES = [
   { key: "VOC",  label: "VOCs",             unit: "ppb",   base: 50 },
   { key: "PM25", label: "PM2.5",            unit: "ug/m3", base: 8 }
 ];
-const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", E: "#c62828" };
+const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", F: "#c62828" };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -108,6 +109,25 @@ function gradeBadge(g) {
 }
 function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 
+const GRADE_WORDS = {A: "Amazing", B: "Good", C: "Okay", D: "Bad", F: "Very Bad"};
+const HIGH_RATIO = 2;
+function description(r){
+  const ratios = GASES
+          .map((g) => {
+            const x = r.gases && r.gases[g.key];
+            return x && x.baseline ? {key: g.key, ratio: x.value/x.baseline} : null;
+          })
+          .filter(Boolean);
+
+  const high = ratios.filter((x) => x.ratio >= HIGH_RATIO)
+          .sort((a, b) => b.ratio - a.ratio);
+  const word = GRADE_WORDS[r.grade] || "Unknown";
+
+  if (!ratios.length) return word;
+  if (!high.length) return word + ": all gasses near baseline";
+  return word + ": elevated " +
+          high.map((x) => x.key + " (" + x.ratio.toFixed(1) + "x)").join(", ");
+}
 let deviceId = null, latest = null, unsub = null, registering = false;
 let map = null, pin = null, markers = null;
 
@@ -202,11 +222,11 @@ function renderTable(rows) {
   const head = $("table-head"), body = $("table-body");
   head.replaceChildren(); body.replaceChildren();
   const hr = el("tr");
-  ["Device time", "Grade", ...GASES.map((g) => g.key + " (" + g.unit + ")")].forEach((t) => hr.append(el("th", t)));
+  ["Device time", "Grade", "Summary", ...GASES.map((g) => g.key + " (" + g.unit + ")")].forEach((t) => hr.append(el("th", t)));
   head.append(hr);
   rows.forEach((r) => {
     const tr = el("tr");
-    tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade));
+    tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade), el("td", description(r), "summary"));
     GASES.forEach((g) => tr.append(el("td", (r.gases && r.gases[g.key]) ? r.gases[g.key].value : "")));
     body.append(tr);
   });
@@ -218,7 +238,7 @@ $("add-test-btn").onclick = async () => {
   GASES.forEach((g) => {
     gases[g.key] = { value: +(g.base * (0.5 + Math.random() * 3)).toFixed(2), baseline: g.base };
   });
-  const grade = "ABCDE"[Math.floor(Math.random() * 5)];
+  const grade = "ABCDF"[Math.floor(Math.random() * 5)];
   try {
     await addDoc(collection(db, "devices", deviceId, "readings"),
       { timestamp: Timestamp.fromDate(new Date()), grade, gases });
