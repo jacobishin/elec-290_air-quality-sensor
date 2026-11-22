@@ -38,7 +38,7 @@ LCD
 // ============================================================
 
 // 1 = enable Serial Monitor verification test suite, 0 = disable for final release
-#define ENABLE_VERIFICATION_TESTS 1
+#define ENABLE_VERIFICATION_TESTS 0
 
 // Wi-Fi & database credentials
 const char* WIFI_SSID = "jacob";
