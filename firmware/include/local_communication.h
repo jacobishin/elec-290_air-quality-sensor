@@ -7,7 +7,7 @@
 #include <Adafruit_ST7789.h>
 
 // ============================================================
-// FROM MAIN.CPPs
+// FROM MAIN.CPP
 // ============================================================
 
 typedef enum faultenum {NONE, SENSOR, STORAGE, INVALID, STALE, WIFI} faultenum;
@@ -44,27 +44,25 @@ struct FaultStatus {
 };
 
 // ============================================================
-// UI & JOYSTICK STATE
+// UI STATE
 // ============================================================
 
-enum DisplayPage {
-  PAGE_OVERVIEW = 0, // 2x3 grid of all 6 sensors + top Wi-Fi/Alert bar
-  PAGE_DETAIL   = 1, // Single sensor large readout + threshold info
-  PAGE_SYSTEM   = 2, // Fault counters, storage file info, and sync status
-  PAGE_COUNT    = 3
+enum DisplayScreen {
+  PAGE_DASHBOARD = 0, // 2x3 grid of all 6 sensors + Wi-Fi header + status banner
+  SETTINGS_MENU,      // System & Faults, Buzzer Volume, Back
+  SYSTEM_PAGE,        // LittleFS/NTP sync (R5) & 5 fault counters (R8)
+  BUZZER_PAGE         // Volume 0..10 (NVS saved) + Test Sound
 };
 
 struct UIState {
-  DisplayPage currentPage   = PAGE_OVERVIEW;
-  uint8_t selectedSensor    = 0;     // 0=CO, 1=TVOC, 2=eCO2, 3=Temp, 4=Hum, 5=PM2.5
-  bool needsFullRedraw      = true;  // Redraws static frames only on page change
-  bool alertMutedByJoystick = false; // Pressing joystick button mutes buzzer for current alert
-  unsigned long lastJoyPoll = 0;
-  unsigned long lastJoyMove = 0;
+  DisplayScreen currentScreen = PAGE_DASHBOARD;
+  int menuIndex               = 0;     // 0=System, 1=Buzzer, 2=Back
+  int buzzRow                 = 0;     // 0=Volume, 1=Test, 2=Back
+  bool alertMutedByJoystick   = false; // Silences buzzer until danger clears
 };
 
 // ============================================================
-// FUNCTION DECLARATIONS
+// PUBLIC MODULE API (Called by main.cpp)
 // ============================================================
 
 void initDisplayAndJoystickHardware();
