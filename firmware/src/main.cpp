@@ -5,7 +5,7 @@ Hardware:
 ESP32-WROVER
 SGP30 - eCO2 and TVOC sensor
 MQ-7 - CO sensor
-DHT11 - temp and humid sensor
+DHT22 - temp and humid sensor
 PMS7003 - pm2.5 sensor
 Buzzer
 LCD
@@ -31,7 +31,7 @@ LCD
 #include <PMS7003.h>
 
 #include "local_communication.h" // Display, Joystick, and Buzzer module
-#include "tests.h" // Testing helper functions
+#include "tests.h"               // Testing helper functions
 
 
 
@@ -39,27 +39,30 @@ LCD
 /* CONFIGURATION */
 // ============================================================
 
-// Wi-Fi & database credentials
-const char* WIFI_SSID = "WIFI_NAME";
-const char* WIFI_PASSWORD = "WIFI_PASSWORD";
+// 1 = enable Serial Monitor verification test suite, 0 = disable for final release
+#define ENABLE_VERIFICATION_TESTS 0
 
-const char* FIREBASE_URL =""; // idk if itll be a url or an endpoint
-const char* FIREBASE_AUTH_TOKEN = ""; // idk if actual authentication is necessary
+// Wi-Fi & database credentials
+const char* WIFI_SSID = "jacob";
+const char* WIFI_PASSWORD = "341145100";
+
+const char* FIREBASE_URL ="https://gas-monitor-6e3eb-default-rtdb.firebaseio.com/devices/monitor-01/readings.json"; // idk if itll be a url or an endpoint
+const char* FIREBASE_AUTH_TOKEN = "1YfvkBGVE4v2KK5FFd7N1QkqjXl5opGkmFKVwLUd"; // idk if actual authentication is necessary
 
 // Pin assignments (ESP32 GPIO numbers from schematic U1)
 const int I2C_SDA_SGP30_PIN  = 21; // IO21 (Schematic physical pin 33)
 const int I2C_SCL_SGP30_PIN  = 22; // IO22 (Schematic physical pin 36)
 
-const int I2C_SDA_SCREEN_PIN = 23; // IO23 (Schematic physical pin 37 - SDA/MOSI on CN1)
-const int I2C_SCL_SCREEN_PIN = 18; // IO18 (Schematic physical pin 30 - SCL/SCK on CN1)
-const int SCREEN_CS_PIN      = 5;  // IO5  (Schematic physical pin 29 - CS on CN1)
-const int SCREEN_DC_PIN      = 27; // IO27 (Schematic physical pin 12 - DC on CN1)
-const int SCREEN_RST_PIN     = 26; // IO26 (Schematic physical pin 11 - RST on CN1)
+extern const int I2C_SDA_SCREEN_PIN = 23; // IO23 (Schematic physical pin 37 - SDA/MOSI on CN1)
+extern const int I2C_SCL_SCREEN_PIN = 18; // IO18 (Schematic physical pin 30 - SCL/SCK on CN1)
+extern const int SCREEN_CS_PIN      = 5;  // IO5  (Schematic physical pin 29 - CS on CN1)
+extern const int SCREEN_DC_PIN      = 27; // IO27 (Schematic physical pin 12 - DC on CN1)
+extern const int SCREEN_RST_PIN     = 26; // IO26 (Schematic physical pin 11 - RST on CN1)
 
 // Joystick pins (H3)
-const int JOY_X_PIN  = 34; // IO34 (Schematic physical pin 6 - VRx)
-const int JOY_Y_PIN  = 35; // IO35 (Schematic physical pin 7 - VRy)
-const int JOY_SW_PIN = 32; // IO32 (Schematic physical pin 8 - SW)
+extern const int JOY_X_PIN  = 34; // IO34 (Schematic physical pin 6 - VRx)
+extern const int JOY_Y_PIN  = 35; // IO35 (Schematic physical pin 7 - VRy)
+extern const int JOY_SW_PIN = 32; // IO32 (Schematic physical pin 8 - SW)
 
 const int PMS_RX_PIN = 33; // IO33 (Schematic physical pin 9 - RX)
 const int PMS_TX_PIN = 19; // IO19 (Schematic physical pin 31 - TX)
@@ -70,7 +73,7 @@ const int DHT_PIN   = 13; // IO13 (Schematic physical pin 16 - OUT)
 const int SGP30_PIN = 21; // Uses I2C (IO21 / IO22)
 const int PM25_PIN  = 33; // Uses UART2 (IO33 / IO19)
 
-const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
+extern const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
 
 // Sensor sampling intervals
 const unsigned long MQ7_SAMPLE_INTERVAL = 1000;
@@ -102,22 +105,22 @@ const char* CSV_HEADER = "timestamp_ms,alert_active,"
                          "pm25_avg,pm25_count,pm25_valid";
 
 
-// Air quality thresholds
-const float C0_THRESHOLD1_PPM = NULL;
-const float TVOC_THRESHOLD1_PPB = NULL;
-const float ECO2_THRESHOLD1_PPM = NULL;
-const float PM25_THRESHOLD1_UGM3 = NULL;
+// Air quality thresholds (-1.0f = unconfigured placeholder)
+extern const float C0_THRESHOLD1_PPM   = -1.0f;
+extern const float TVOC_THRESHOLD1_PPB = -1.0f;
+extern const float ECO2_THRESHOLD1_PPM = -1.0f;
+extern const float PM25_THRESHOLD1_UGM3 = -1.0f;
 
-const float C0_THRESHOLD2_PPM = NULL;
-const float TVOC_THRESHOLD2_PPB = NULL;
-const float ECO2_THRESHOLD2_PPM = NULL;
-const float PM25_THRESHOLD2_UGM3 = NULL;
+extern const float C0_THRESHOLD2_PPM   =  200;
+extern const float TVOC_THRESHOLD2_PPB = -1.0f;
+extern const float ECO2_THRESHOLD2_PPM = 4000;
+extern const float PM25_THRESHOLD2_UGM3 = -1.0f;
 
-const int allowedSensorFaults = NULL;
-const int allowedInvalidReadings = NULL;
-const int allowedStaleReadings = NULL;
-const int allowedStorageFaults = NULL;
-const int allowedWifiFaults = NULL;
+const int allowedSensorFaults    = 1;
+const int allowedInvalidReadings = 1;
+const int allowedStaleReadings   = 1;
+const int allowedStorageFaults   = 1;
+const int allowedWifiFaults      = 1;
 
 
 // ============================================================
@@ -233,26 +236,14 @@ void initializeCommunication();
 void initializeAlerts();
 
 // Data acquisition
-bool readmq7();
-bool readpm25();
-bool readtemp();
-bool readhum();
-bool readsgp30();
+void acquireMQ7(unsigned long currentTime);
+void acquireSGP30(unsigned long currentTime);
+void acquireTempHumidity(unsigned long currentTime);
+void acquirePM25(unsigned long currentTime);
 
-int processData(bool option);
-
-bool isMax(int val1, int val2);
-bool isMin(int val1, int val2);
-
-void clearSafetyAccumulators();
-void clearAccumulators();
 
 // Data processing & fault detection
-
-// the general idea is that the sensors will take an average reading every 5 seconds and display it, 
-// then take the average of 60 seconds and save and upload it every 60 seconds. each sensor has 
-// its own sampling interval. for the average readings every 5 seconds, 
-// it should remove the highest and lowest reading, then take the average of whats left
+int processData(bool option);
 int faultDetections(faultenum fault, bool override);
 
 
@@ -282,7 +273,9 @@ void checkWiFiConnection();
 void setup() {
   Serial.begin(115200);
   initializeSystem();
-  Serial.println("Harmful Gas Monitor Started (Type 'H' for test commands)\n");
+  checkWiFiConnection();
+  updateDisplay(displayData);
+  Serial.println("Harmful Gas Monitor Started.\n");
 }
   unsigned long lastTime1 = 0;
   unsigned long lastTimetemphum = 0;
@@ -293,7 +286,7 @@ void setup() {
 // ============================================================
 void loop() {
   unsigned long currentTime = millis();
-  
+
   // Data acquisitiion
 
   // data processing and fault detection
@@ -301,28 +294,14 @@ void loop() {
   // Decision logic
   updateAlerts();
 
-  // Communicaton
+  // --- Section 6: Communication (Joystick, Alert Flashing, Firebase Upload) ---
   updateCommunication(currentTime);
 
-  if (currentTime-lastTime1 > 1000){
-    readpm25();
-    readsgp30();
-    lastTime1 = currentTime;
-  }
-  if (currentTime-lastTimetemphum > 2000){
-    readtemp();
-    readhum();
-    lastTimetemphum = currentTime;
-  }
-  if (currentTime-send > 60000){
-    processData(1);
-  }else if (currentTime-display > 5000){
-    processData(0);
-  }
   // Data storage
 
   // Testing commands (from tests.cpp)
   runTestCommands();
+#endif
 }
 
 // ============================================================
@@ -343,6 +322,7 @@ void initializeSensors() {
   Serial.println("Initializing sensor pins and buses...");
   pinMode(MQ7_PIN, INPUT);
   analogReadResolution(12);
+  analogSetPinAttenuation(MQ7_PIN, ADC_11db);
 
   Wire.begin(I2C_SDA_SGP30_PIN, I2C_SCL_SGP30_PIN);
   dht.begin();
@@ -660,7 +640,7 @@ void clearAccumulators(){
 /// @param val1 
 /// @param val2 
 /// @return bool
-bool isMax(int val1, int val2){
+bool isMax(float val1, float val2){
   return (val1 > val2) ? true: false;
 }
 
@@ -675,6 +655,37 @@ bool isMin(int val1, int val2){
 // ============================================================
 /* DATA PROCESSING & FAULT DETECTION */
 // ============================================================
+
+//!!Copy and pasted here so I don't have to scroll all the way back up 
+/*struct SensorTotal {
+  float sum = 0.0f;
+  float maximum = -INFINITY;
+  unsigned int count = 0;
+};
+struct SensorAccumulators {
+  SensorTotal coPPM;
+  SensorTotal tvocPPB;
+  SensorTotal eco2PPM;
+  SensorTotal temperatureC;
+  SensorTotal humidityPercent;
+  SensorTotal pm25UGM3;
+};
+struct AverageData {
+  float average = NAN;
+  float maximum = NAN;
+  unsigned int sampleCount = 0;
+  bool valid = false;
+};
+struct ProcessedData {
+  unsigned long windowEndTimestamp = 0;
+  AverageData coPPM;
+  AverageData tvocPPB;
+  AverageData eco2PPM;
+  AverageData temperatureC;
+  AverageData humidityPercent;
+  AverageData pm25UGM3;
+};*/
+
 /// @brief processes the raw data into averaged data. If this is called with 
 ///        option = true, process the 60 second data. else, process the 5 second data.
 /// @param option 
@@ -745,7 +756,6 @@ int processData(bool option){
     updateDisplay(displayData);
     clearSafetyAccumulators();
     //maybe call updatedisplay?
-    return 1;
 }
 
 /// @brief Increases the number of faults, and determines if faults should be updated 
@@ -823,8 +833,7 @@ int faultDetections(faultenum fault, bool override){
       faults.wifi.status = false;  
     }  
     //update LCD
- } 
-  return 1;
+ }
 }
 
 // ============================================================
@@ -840,18 +849,6 @@ void updateAlerts() {
 // ============================================================
 // 5. DATA STORAGE
 // ============================================================
-// the general idea for data storage is that the esp32 saves the 60-second 
-// average readings directly onto its internal flash memory (LittleFS) so no 
-// data is lost if the power cuts out or the wi-fi drops. to keep the flash 
-// memory from filling up, it alternates between two 100 KB csv files. before 
-// writing a new row, it checks if the current file is full, and if it is, it 
-// wipes the other file, writes the csv headers, and switches over to logging there.
-//
-// it also keeps track of which file is active and the exact byte position of the 
-// last row uploaded to firebase using NVS preferences, so it knows where to pick 
-// back up after a reboot. while the device is offline, it just logs the time in 
-// seconds since boot, and when the rows get uploaded to firebase later, any relative 
-// boot timestamps get converted to real unix timestamps on the fly.
 
 // returns the file path for the active log file (when active is true) or the inactive file (when false)
 const char* getLogFilePath(bool active) {
@@ -892,11 +889,13 @@ void storeData(const ProcessedData &data) {
   // loop through all 6 sensor summaries in ProcessedData and append their avg, count, and valid flag (no max)
   const AverageData* m = &data.coPPM;
   for (int i = 0; i < 6; i++) {
-    pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
-                    (m[i].valid && isfinite(m[i].average))
-                        ? ",%.2f,%u,1"
-                        : ",NAN,%u,%d",
-                    m[i].average, m[i].sampleCount, m[i].valid ? 1 : 0);
+    if (m[i].valid && isfinite(m[i].average)) {
+      pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
+                      ",%.2f,%u,1", m[i].average, m[i].sampleCount);
+    } else {
+      pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
+                      ",NAN,%u,%d", m[i].sampleCount, m[i].valid ? 1 : 0);
+    }
   }
 
   // if adding a new row would make the file too big, wipe the other file and switch over to it
@@ -924,20 +923,8 @@ void storeData(const ProcessedData &data) {
 // ============================================================
 // 6. COMMUNICATION
 // ============================================================
-// the communication section handles everything to do with sending information to 
-// the user and the cloud, so this includes updating the lcd, managing the wi-fi 
-// connection, uploading logs to firebase, and printing debug info to the serial 
-// monitor. every 5 seconds, it checks the wi-fi status and refreshes the lcd to 
-// show whether wi-fi is connected or disconnected, any active gas alerts or sensor 
-// faults, and the 5-second trimmed averages for CO and TVOC.
-//
-// instead of sending live sensor readings straight to the cloud, it reads unsent 
-// rows directly from the local csv file every 2 seconds when wi-fi is connected. 
-// it converts each csv row into a json format (turning any NAN values into null and 
-// converting any offline boot timestamps into real unix time) and sends it to firebase, 
-// only moving the saved upload bookmark forward once firebase confirms it received the data.
 
-// takes a single 20-column comma-separated row from the CSV file and converts it into a nested JSON string for Firebase
+// takes a single 20-column comma-separated row from the CSV file and converts it into JSON for Firebase
 bool csvLineToJson(const String &csvLine, String &jsonOut) {
   if (csvLine.startsWith("timestamp_")) return false;
 
@@ -957,12 +944,14 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
     ts += bootEpochSec;
   }
 
-  // write the timestamp and alert status at the start of the json
+  // write the timestamp at the start of the json (tok[1] / alert_active is intentionally omitted)
   const char* keys[6] = {"co", "tvoc", "eco2", "temp", "hum", "pm25"};
   char jsonBuf[512];
-  int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu,\"alert_active\":%s", ts, tok[1]);
+  int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu", ts);
 
-  // loop through the 6 sensors (3 tokens each: avg, count, valid) and format them into json
+  // ============================================================
+  // ORIGINAL: Nested JSON (subfields: avg, count, valid)
+  // ============================================================
   for (int i = 0; i < 6; i++) {
     int b = 2 + (i * 3);
     pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
@@ -971,6 +960,21 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
                     strcmp(tok[b], "NAN") ? tok[b] : "null",
                     tok[b + 1], tok[b + 2]);
   }
+
+  /* ============================================================
+  // BACKUP OPTION 2: Flat JSON (no subfields, matches CSV_HEADER keys)
+  // To use: comment out the ORIGINAL loop above and uncomment this block.
+  // ============================================================
+  for (int i = 0; i < 6; i++) {
+    int b = 2 + (i * 3);
+    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
+                    ",\"%s_avg\":%s,\"%s_count\":%s,\"%s_valid\":%s",
+                    keys[i], strcmp(tok[b], "NAN") ? tok[b] : "null",
+                    keys[i], tok[b + 1],
+                    keys[i], tok[b + 2]);
+  }
+  */
+
   snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "}");
   jsonOut = jsonBuf;
   return true;
@@ -984,7 +988,7 @@ bool sendJsonToFirebase(const String &jsonPayload) {
   }
 
   static WiFiClientSecure client;
-  client.setInsecure(); // Skip root CA verification for  simplicity
+  client.setInsecure(); // Skip root CA verification for simplicity
 
   HTTPClient http;
   http.setReuse(true);
