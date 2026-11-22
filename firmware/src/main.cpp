@@ -37,9 +37,12 @@ LCD
 /* CONFIGURATION */
 // ============================================================
 
+// TESTING
+#define ENABLE_VERIFICATION_TESTS 1
+
 // Wi-Fi & database credentials
-const char* WIFI_SSID = "WIFI_NAME";
-const char* WIFI_PASSWORD = "WIFI_PASSWORD";
+const char* WIFI_SSID = "jacob";
+const char* WIFI_PASSWORD = "341145100";
 
 const char* FIREBASE_URL =""; // idk if itll be a url or an endpoint
 const char* FIREBASE_AUTH_TOKEN = ""; // idk if actual authentication is necessary
@@ -73,7 +76,7 @@ const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
 // Sensor sampling intervals
 const unsigned long MQ7_SAMPLE_INTERVAL = 1000;
 const unsigned long CCS811_SAMPLE_INTERVAL = 1000;
-const unsigned long TEMPHUM_SAMPLE_INTERVAL = 1000;
+const unsigned long TEMPHUM_SAMPLE_INTERVAL = 2000;
 const unsigned long PM25_SAMPLE_INTERVAL = 1000;
 
 // Stale reading multiplier (stale reading timeout = sample interval * multiplier)
@@ -81,7 +84,7 @@ const unsigned long STALE_TIMEOUT_MULTIPLIER = 3;
 
 
 // Data loggging intervals
-const unsigned long LOG_INTERVAL = 60000; // how often information is logged in flash, as well as uploaded to the website
+const unsigned long LOG_INTERVAL = 300000; // how often information is logged in flash, as well as uploaded to the website
 const unsigned long DISPLAY_INTERVAL = 5000; // how often the display is updated
 const unsigned long TRANSMIT_INTERVAL = 2000; // in cases where the wi-fi drops then reconnects, it will send unsent logs every # seconds
 
@@ -305,8 +308,10 @@ void loop() {
   // --- Section 6: Communication (Joystick, Alert Flashing, Firebase Upload) ---
   updateCommunication(currentTime);
 
-  // --- Testing Commands (tests.cpp) ---
-  runTestCommands();
+  // --- Verification & Testing Suite (tests.cpp) ---
+  #if ENABLE_VERIFICATION_TESTS
+    runTestCommands();
+  #endif
 }
 
 // ============================================================

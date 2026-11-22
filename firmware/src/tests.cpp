@@ -1,10 +1,12 @@
 #include "tests.h"
 #include "local_communication.h"
+#include <WiFi.h>
 #include <LittleFS.h>
 #include <Preferences.h>
+#include <ctype.h>
 
 // ============================================================
-// FROM MAIN.CPP
+// EXTERNAL REFERENCES FROM MAIN.CPP
 // ============================================================
 extern const char* LOG_FILE_1_PATH;
 extern const char* LOG_FILE_2_PATH;
@@ -13,19 +15,30 @@ extern size_t lastUploadedByteOffset;
 extern size_t currentLogFileSize;
 extern bool wifiConnected;
 extern bool timeSyncedThisBoot;
+extern bool dangerAlertActive;
 extern String activeAlertMessage;
+extern ProcessedData displayData;
 extern ProcessedData loggedData;
 extern FaultStatus faults;
 
 extern const char* getLogFilePath(bool active = true);
 extern bool initNewLogFile(uint8_t fileIndex);
 extern int faultDetections(faultenum fault, bool override);
+extern void updateDisplay(const ProcessedData &data);
+extern void checkWiFiConnection();
 
 // ============================================================
-// TESTING & DEBUG FUNCTIONS
+// MODULE TEST STATE
+// ============================================================
+static bool uptimeLogEnabled        = false;
+static unsigned long lastUptimeLog  = 0;
+static bool simulatedWifiDropped    = false;
+
+// ============================================================
+// STORAGE & DIAGNOSTIC COMMANDS
 // ============================================================
 
-// Prints every line of active CSV file on flash to the Serial Monitor
+// Prints every line of active CSV file on flash to the Serial Monitor (RTM R5)
 void dumpActiveLogFile() {
   const char* path = getLogFilePath(true);
   Serial.printf("\n--- DUMPING ACTIVE LOG: %s (%u bytes) ---\n", path, (unsigned int)currentLogFileSize);
@@ -41,15 +54,15 @@ void dumpActiveLogFile() {
   Serial.println("--- END OF FILE ---\n");
 }
 
-// Wipes both CSV files and resets NVS bookmark back to file 1
+// Wipes both CSV files and resets NVS bookmark back to file 1 (RTM R5)
 void resetAllStorageLogs() {
   LittleFS.remove(LOG_FILE_1_PATH);
   LittleFS.remove(LOG_FILE_2_PATH);
   initNewLogFile(1);
-  Serial.println("[TEST] Wiped both CSV log files and reset NVS state to File 1.");
+  Serial.println("[TEST R5] Wiped both CSV log files and reset NVS state to File 1.");
 }
 
-// Prints current file system and Firebase upload bookmark
+// Prints current file system and Firebase upload bookmark (RTM R5/R6)
 void printStorageSyncStatus() {
   Serial.println("\n--- STORAGE & SYNC STATUS ---");
   Serial.printf("Active File      : %s (Index %u)\n", getLogFilePath(true), activeLogFileIndex);
@@ -63,7 +76,7 @@ void printStorageSyncStatus() {
   Serial.println("-----------------------------\n");
 }
 
-// Prints a summary of the 60-second sensor averages, alert status, and fault counts to the Serial Monitor
+// Prints a summary of the 60-second sensor averages, alert status, and fault counts (RTM R7)
 void printDebugInformation() {
   Serial.println();
   Serial.printf("===== 60s WINDOW SUMMARY (Active File: %s) =====\n", getLogFilePath(true));
@@ -78,24 +91,106 @@ void printDebugInformation() {
   Serial.println("============================================================");
 }
 
-// Listens for single-letter test commands over USB Serial ('d', 'r', 's', 'p', 'f', 'c')
+// ============================================================
+// SIMULATION & VERIFICATION COMMANDS (RTM R1, R3, R4, R6, R7, R8)
+// ============================================================
+
+// [1] R1 & T1.1: Inject valid mock readings into displayData & loggedData
+static void testInjectValidData() {
+  unsigned long now = millis();
+  displayData.windowEndTimestamp = now;
+  displayData.coPPM              = { 12.5f, 15.0f, 5, true };
+  displayData.tvocPPB            = { 85.0f, 95.0f, 5, true };
+  displayData.eco2PPM            = { 480.0f, 510.0f, 5, true };
+  displayData.temperatureC       = { 22.4f, 22.6f, 3, true };
+  displayData.humidityPercent    = { 46.0f, 47.0f, 3, true };
+  displayData.pm25UGM3           = { 9.2f, 10.0f, 5, true };
+  loggedData = displayData;
+  updateDisplay(displayData);
+  Serial.println("[TEST R1/T1.1] Injected valid mock sensor data to LCD & loggedData.");
+}
+
+// [2] R8 & T1.2: Inject invalid/unreasonable readings (NaN & negative)
+static void testInjectInvalidData() {
+  displayData.coPPM    = { NAN, NAN, 0, false };
+  displayData.pm25UGM3 = { -5.0f, -5.0f, 0, false };
+  loggedData.coPPM     = displayData.coPPM;
+  loggedData.pm25UGM3  = displayData.pm25UGM3;
+  faultDetections(INVALID, false);
+  updateDisplay(displayData);
+  Serial.println("[TEST R8/T1.2] Injected invalid CO (NaN) & PM2.5 (-5.0) readings.");
+}
+
+// [3] R3: Toggle emergency Danger Alert (<= 2s response test)
+static void testToggleDangerAlert() {
+  dangerAlertActive  = !dangerAlertActive;
+  activeAlertMessage = dangerAlertActive ? "HIGH CO (TEST)" : "Normal";
+  updateDisplay(displayData);
+  Serial.printf("[TEST R3] Danger Alert %s at %lu ms.\n",
+                dangerAlertActive ? "ACTIVATED" : "CLEARED", millis());
+}
+
+// [4] R6 & T1.3: Toggle forced Wi-Fi disconnect / reconnect
+static void testToggleWiFiDrop() {
+  if (!simulatedWifiDropped) {
+    simulatedWifiDropped = true;
+    WiFi.disconnect();
+    checkWiFiConnection();
+    updateDisplay(displayData);
+    Serial.println("[TEST R6/T1.3] Forced Wi-Fi DISCONNECT (check WiFi:DC & offline buffering).");
+  } else {
+    simulatedWifiDropped = false;
+    WiFi.reconnect();
+    Serial.println("[TEST R6/T1.3] Triggered Wi-Fi RECONNECT (watch unsent bytes drain).");
+  }
+}
+
+// [5] R4 & R7: Toggle 60-second battery endurance & interval heartbeat log
+static void testToggleUptimeHeartbeat() {
+  uptimeLogEnabled = !uptimeLogEnabled;
+  lastUptimeLog    = millis();
+  Serial.printf("[TEST R4/R7] 60s Uptime Heartbeat %s.\n", uptimeLogEnabled ? "ENABLED" : "DISABLED");
+}
+
+// ============================================================
+// MAIN TEST RUNNER (Called in loop() when ENABLE_VERIFICATION_TESTS == 1)
+// ============================================================
 void runTestCommands() {
+  // Periodic 60-second uptime log for R4/R7 endurance testing (when toggled on with '5')
+  if (uptimeLogEnabled && (millis() - lastUptimeLog >= 60000UL)) {
+    lastUptimeLog = millis();
+    unsigned int unsent = (currentLogFileSize > lastUploadedByteOffset)
+                          ? (unsigned int)(currentLogFileSize - lastUploadedByteOffset) : 0;
+    Serial.printf("[TEST R4/R7] Uptime: %lu min | File: %u B | Unsent: %u B | WiFi: %s\n",
+                  lastUptimeLog / 60000UL, (unsigned int)currentLogFileSize,
+                  unsent, wifiConnected ? "OK" : "DC");
+  }
+
   if (!Serial.available()) return;
-  char cmd = Serial.read() | 0x20; // Convert uppercase to lowercase
+  int cmd = tolower((unsigned char)Serial.read());
 
   switch (cmd) {
-    case 'd': dumpActiveLogFile();      break;
-    case 'r': resetAllStorageLogs();    break;
-    case 's': printStorageSyncStatus(); break;
-    case 'p': printDebugInformation();  break;
-    case 'f': faultDetections(STORAGE, false); break;
+    case 'd': dumpActiveLogFile();       break;
+    case 'r': resetAllStorageLogs();     break;
+    case 's': printStorageSyncStatus();  break;
+    case 'p': printDebugInformation();   break;
+    case 'f': faultDetections(STORAGE, false); Serial.println("[TEST R8] Storage fault injected."); break;
     case 'c':
       faultDetections(SENSOR, true);
       faultDetections(INVALID, true);
       faultDetections(STALE, true);
       faultDetections(STORAGE, true);
       faultDetections(WIFI, true);
+      dangerAlertActive  = false;
+      activeAlertMessage = "Normal";
+      updateDisplay(displayData);
+      Serial.println("[TEST R8] Cleared all faults and reset danger alert.");
       break;
+    case '1': testInjectValidData();       break;
+    case '2': testInjectInvalidData();     break;
+    case '3': testToggleDangerAlert();     break;
+    case '4': testToggleWiFiDrop();        break;
+    case '5': testToggleUptimeHeartbeat(); break;
     default: break;
   }
 }
