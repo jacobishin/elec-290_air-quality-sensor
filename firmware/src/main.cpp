@@ -37,8 +37,8 @@ LCD
 /* CONFIGURATION */
 // ============================================================
 
-// TESTING
-#define ENABLE_VERIFICATION_TESTS 0
+// 1 = enable Serial Monitor verification test suite, 0 = disable for final release
+#define ENABLE_VERIFICATION_TESTS 1
 
 // Wi-Fi & database credentials
 const char* WIFI_SSID = "jacob";
@@ -51,16 +51,16 @@ const char* FIREBASE_AUTH_TOKEN = ""; // idk if actual authentication is necessa
 const int I2C_SDA_SGP30_PIN  = 21; // IO21 (Schematic physical pin 33)
 const int I2C_SCL_SGP30_PIN  = 22; // IO22 (Schematic physical pin 36)
 
-const int I2C_SDA_SCREEN_PIN = 23; // IO23 (Schematic physical pin 37 - SDA/MOSI on CN1)
-const int I2C_SCL_SCREEN_PIN = 18; // IO18 (Schematic physical pin 30 - SCL/SCK on CN1)
-const int SCREEN_CS_PIN      = 5;  // IO5  (Schematic physical pin 29 - CS on CN1)
-const int SCREEN_DC_PIN      = 27; // IO27 (Schematic physical pin 12 - DC on CN1)
-const int SCREEN_RST_PIN     = 26; // IO26 (Schematic physical pin 11 - RST on CN1)
+extern const int I2C_SDA_SCREEN_PIN = 23; // IO23 (Schematic physical pin 37 - SDA/MOSI on CN1)
+extern const int I2C_SCL_SCREEN_PIN = 18; // IO18 (Schematic physical pin 30 - SCL/SCK on CN1)
+extern const int SCREEN_CS_PIN      = 5;  // IO5  (Schematic physical pin 29 - CS on CN1)
+extern const int SCREEN_DC_PIN      = 27; // IO27 (Schematic physical pin 12 - DC on CN1)
+extern const int SCREEN_RST_PIN     = 26; // IO26 (Schematic physical pin 11 - RST on CN1)
 
 // Joystick pins (H3)
-const int JOY_X_PIN  = 34; // IO34 (Schematic physical pin 6 - VRx)
-const int JOY_Y_PIN  = 35; // IO35 (Schematic physical pin 7 - VRy)
-const int JOY_SW_PIN = 32; // IO32 (Schematic physical pin 8 - SW)
+extern const int JOY_X_PIN  = 34; // IO34 (Schematic physical pin 6 - VRx)
+extern const int JOY_Y_PIN  = 35; // IO35 (Schematic physical pin 7 - VRy)
+extern const int JOY_SW_PIN = 32; // IO32 (Schematic physical pin 8 - SW)
 
 const int PMS_RX_PIN = 33; // IO33 (Schematic physical pin 9 - RX)
 const int PMS_TX_PIN = 19; // IO19 (Schematic physical pin 31 - TX)
@@ -71,12 +71,12 @@ const int DHT_PIN   = 13; // IO13 (Schematic physical pin 16 - OUT)
 const int SGP30_PIN = 21; // Uses I2C (IO21 / IO22)
 const int PM25_PIN  = 33; // Uses UART2 (IO33 / IO19)
 
-const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
+extern const int BUZZER_PIN = 25; // IO25 (Schematic physical pin 10 - PIN 25)
 
 // Sensor sampling intervals
 const unsigned long MQ7_SAMPLE_INTERVAL = 1000;
 const unsigned long CCS811_SAMPLE_INTERVAL = 1000;
-const unsigned long TEMPHUM_SAMPLE_INTERVAL = 2000;
+const unsigned long TEMPHUM_SAMPLE_INTERVAL = 1000;
 const unsigned long PM25_SAMPLE_INTERVAL = 1000;
 
 // Stale reading multiplier (stale reading timeout = sample interval * multiplier)
@@ -84,7 +84,7 @@ const unsigned long STALE_TIMEOUT_MULTIPLIER = 3;
 
 
 // Data loggging intervals
-const unsigned long LOG_INTERVAL = 300000; // how often information is logged in flash, as well as uploaded to the website
+const unsigned long LOG_INTERVAL = 60000; // how often information is logged in flash, as well as uploaded to the website
 const unsigned long DISPLAY_INTERVAL = 5000; // how often the display is updated
 const unsigned long TRANSMIT_INTERVAL = 2000; // in cases where the wi-fi drops then reconnects, it will send unsent logs every # seconds
 
@@ -103,22 +103,22 @@ const char* CSV_HEADER = "timestamp_ms,alert_active,"
                          "pm25_avg,pm25_count,pm25_valid";
 
 
-// Air quality thresholds
-const float C0_THRESHOLD1_PPM = NULL;
-const float TVOC_THRESHOLD1_PPB = NULL;
-const float ECO2_THRESHOLD1_PPM = NULL;
-const float PM25_THRESHOLD1_UGM3 = NULL;
+// Air quality thresholds (-1.0f = unconfigured placeholder)
+extern const float C0_THRESHOLD1_PPM   = -1.0f;
+extern const float TVOC_THRESHOLD1_PPB = -1.0f;
+extern const float ECO2_THRESHOLD1_PPM = -1.0f;
+extern const float PM25_THRESHOLD1_UGM3 = -1.0f;
 
-const float C0_THRESHOLD2_PPM = NULL;
-const float TVOC_THRESHOLD2_PPB = NULL;
-const float ECO2_THRESHOLD2_PPM = NULL;
-const float PM25_THRESHOLD2_UGM3 = NULL;
+extern const float C0_THRESHOLD2_PPM   =  200;
+extern const float TVOC_THRESHOLD2_PPB = -1.0f;
+extern const float ECO2_THRESHOLD2_PPM = 4000;
+extern const float PM25_THRESHOLD2_UGM3 = -1.0f;
 
-const int allowedSensorFaults = NULL;
-const int allowedInvalidReadings = NULL;
-const int allowedStaleReadings = NULL;
-const int allowedStorageFaults = NULL;
-const int allowedWifiFaults = NULL;
+const int allowedSensorFaults    = 1;
+const int allowedInvalidReadings = 1;
+const int allowedStaleReadings   = 1;
+const int allowedStorageFaults   = 1;
+const int allowedWifiFaults      = 1;
 
 
 // ============================================================
@@ -232,6 +232,9 @@ void initializeCommunication();
 void initializeAlerts();
 
 // Data acquisition
+void readSensors();
+void accumulateData();
+bool isMax(float val1, float val2);
 void acquireMQ7(unsigned long currentTime);
 void acquireSGP30(unsigned long currentTime);
 void acquireTempHumidity(unsigned long currentTime);
@@ -239,11 +242,7 @@ void acquirePM25(unsigned long currentTime);
 
 
 // Data processing & fault detection
-
-// the general idea is that the sensors will take an average reading every 5 seconds and display it, 
-// then take the average of 60 seconds and save and upload it every 60 seconds. each sensor has 
-// its own sampling interval. for the average readings every 5 seconds, 
-// it should remove the highest and lowest reading, then take the average of whats left
+int processData(bool option);
 int faultDetections(faultenum fault, bool override);
 
 
@@ -309,9 +308,9 @@ void loop() {
   updateCommunication(currentTime);
 
   // --- Verification & Testing Suite (tests.cpp) ---
-  #if ENABLE_VERIFICATION_TESTS
-    runTestCommands();
-  #endif
+#if ENABLE_VERIFICATION_TESTS
+  runTestCommands();
+#endif
 }
 
 // ============================================================
@@ -535,43 +534,13 @@ void accumulateData(){
 /// @param val1 
 /// @param val2 
 /// @return bool
-bool isMax(int val1, int val2){
+bool isMax(float val1, float val2){
   return (val1 > val2) ? true: false;
 }
 
 // ============================================================
 /* DATA PROCESSING & FAULT DETECTION */
 // ============================================================
-
-//!!Copy and pasted here so I don't have to scroll all the way back up 
-/*struct SensorTotal {
-  float sum = 0.0f;
-  float maximum = -INFINITY;
-  unsigned int count = 0;
-};
-struct SensorAccumulators {
-  SensorTotal coPPM;
-  SensorTotal tvocPPB;
-  SensorTotal eco2PPM;
-  SensorTotal temperatureC;
-  SensorTotal humidityPercent;
-  SensorTotal pm25UGM3;
-};
-struct AverageData {
-  float average = NAN;
-  float maximum = NAN;
-  unsigned int sampleCount = 0;
-  bool valid = false;
-};
-struct ProcessedData {
-  unsigned long windowEndTimestamp = 0;
-  AverageData coPPM;
-  AverageData tvocPPB;
-  AverageData eco2PPM;
-  AverageData temperatureC;
-  AverageData humidityPercent;
-  AverageData pm25UGM3;
-};*/
 
 /// @brief processes the raw data into averaged data. If this is called with 
 ///        option = true, process the 60 second data. else, process the 5 second data.
@@ -626,6 +595,7 @@ int processData(bool option){
     displayData.tvocPPB.maximum=safetyAccumulators.tvocPPB.maximum;
 
     //maybe call updatedisplay?
+    return 0;
 }
 
 /// @brief Increases the number of faults, and determines if faults should be updated 
@@ -704,6 +674,7 @@ int faultDetections(faultenum fault, bool override){
     }  
     //update LCD
  }
+ return 0;
 }
 
 // ============================================================
@@ -719,18 +690,6 @@ void updateAlerts() {
 // ============================================================
 // 5. DATA STORAGE
 // ============================================================
-// the general idea for data storage is that the esp32 saves the 60-second 
-// average readings directly onto its internal flash memory (LittleFS) so no 
-// data is lost if the power cuts out or the wi-fi drops. to keep the flash 
-// memory from filling up, it alternates between two 100 KB csv files. before 
-// writing a new row, it checks if the current file is full, and if it is, it 
-// wipes the other file, writes the csv headers, and switches over to logging there.
-//
-// it also keeps track of which file is active and the exact byte position of the 
-// last row uploaded to firebase using NVS preferences, so it knows where to pick 
-// back up after a reboot. while the device is offline, it just logs the time in 
-// seconds since boot, and when the rows get uploaded to firebase later, any relative 
-// boot timestamps get converted to real unix timestamps on the fly.
 
 // returns the file path for the active log file (when active is true) or the inactive file (when false)
 const char* getLogFilePath(bool active) {
@@ -771,11 +730,13 @@ void storeData(const ProcessedData &data) {
   // loop through all 6 sensor summaries in ProcessedData and append their avg, count, and valid flag (no max)
   const AverageData* m = &data.coPPM;
   for (int i = 0; i < 6; i++) {
-    pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
-                    (m[i].valid && isfinite(m[i].average))
-                        ? ",%.2f,%u,1"
-                        : ",NAN,%u,%d",
-                    m[i].average, m[i].sampleCount, m[i].valid ? 1 : 0);
+    if (m[i].valid && isfinite(m[i].average)) {
+      pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
+                      ",%.2f,%u,1", m[i].average, m[i].sampleCount);
+    } else {
+      pos += snprintf(csvRow + pos, sizeof(csvRow) - pos,
+                      ",NAN,%u,%d", m[i].sampleCount, m[i].valid ? 1 : 0);
+    }
   }
 
   // if adding a new row would make the file too big, wipe the other file and switch over to it
@@ -829,7 +790,9 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
   char jsonBuf[512];
   int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu", ts);
 
+  // ============================================================
   // ORIGINAL: Nested JSON (subfields: avg, count, valid)
+  // ============================================================
   for (int i = 0; i < 6; i++) {
     int b = 2 + (i * 3);
     pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
@@ -839,8 +802,10 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
                     tok[b + 1], tok[b + 2]);
   }
 
-  /*
-  // Backup: no subfields
+  /* ============================================================
+  // BACKUP OPTION 2: Flat JSON (no subfields, matches CSV_HEADER keys)
+  // To use: comment out the ORIGINAL loop above and uncomment this block.
+  // ============================================================
   for (int i = 0; i < 6; i++) {
     int b = 2 + (i * 3);
     pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
