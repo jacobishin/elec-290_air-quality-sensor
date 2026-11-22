@@ -44,8 +44,8 @@ LCD
 const char* WIFI_SSID = "jacob";
 const char* WIFI_PASSWORD = "341145100";
 
-const char* FIREBASE_URL =""; // idk if itll be a url or an endpoint
-const char* FIREBASE_AUTH_TOKEN = ""; // idk if actual authentication is necessary
+const char* FIREBASE_URL ="https://gas-monitor-6e3eb-default-rtdb.firebaseio.com"; // idk if itll be a url or an endpoint
+const char* FIREBASE_AUTH_TOKEN = "1YfvkBGVE4v2KK5FFd7N1QkqjXl5opGkmFKVwLUd"; // idk if actual authentication is necessary
 
 // Pin assignments (ESP32 GPIO numbers from schematic U1)
 const int I2C_SDA_SGP30_PIN  = 21; // IO21 (Schematic physical pin 33)
