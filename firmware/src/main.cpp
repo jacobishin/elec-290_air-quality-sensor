@@ -91,10 +91,10 @@ const unsigned long DISPLAY_INTERVAL = 5000; // how often the display is updated
 const unsigned long TRANSMIT_INTERVAL = 2000; // in cases where the wi-fi drops then reconnects, it will send unsent logs every # seconds
 
 
-// File system constants
+// File system constants (64 KB per file fits safely inside 192 KB min_spiffs.csv LittleFS)
 const char* LOG_FILE_1_PATH    = "/sensor_log_1.csv";
 const char* LOG_FILE_2_PATH    = "/sensor_log_2.csv";
-const size_t MAX_LOG_FILE_SIZE = 100000;
+const size_t MAX_LOG_FILE_SIZE = 65536;
 
 const char* CSV_HEADER = "timestamp_ms,alert_active,"
                          "co_avg,co_count,co_valid,"
@@ -106,15 +106,15 @@ const char* CSV_HEADER = "timestamp_ms,alert_active,"
 
 
 // Air quality thresholds (-1.0f = unconfigured placeholder)
-extern const float C0_THRESHOLD1_PPM   = -1.0f;
-// extern const float TVOC_THRESHOLD1_PPB = -1.0f;
-extern const float ECO2_THRESHOLD1_PPM = -1.0f;
-// extern const float PM25_THRESHOLD1_UGM3 = -1.0f;
+extern const float C0_THRESHOLD1_PPM    = -1.0f;
+extern const float TVOC_THRESHOLD1_PPB  = -1.0f;
+extern const float ECO2_THRESHOLD1_PPM  = -1.0f;
+extern const float PM25_THRESHOLD1_UGM3 = -1.0f;
 
-extern const float C0_THRESHOLD2_PPM   =  200;
-// extern const float TVOC_THRESHOLD2_PPB = -1.0f;
-extern const float ECO2_THRESHOLD2_PPM = 4000;
-// extern const float PM25_THRESHOLD2_UGM3 = -1.0f;
+extern const float C0_THRESHOLD2_PPM    = 200.0f;
+extern const float TVOC_THRESHOLD2_PPB  = -1.0f;
+extern const float ECO2_THRESHOLD2_PPM  = 4000.0f;
+extern const float PM25_THRESHOLD2_UGM3 = -1.0f;
 
 const int allowedSensorFaults    = 1;
 const int allowedInvalidReadings = 1;
@@ -240,6 +240,11 @@ void acquireMQ7(unsigned long currentTime);
 void acquireSGP30(unsigned long currentTime);
 void acquireTempHumidity(unsigned long currentTime);
 void acquirePM25(unsigned long currentTime);
+bool readpm25();
+void clearSafetyAccumulators();
+void clearAccumulators();
+bool isMax(float val1, float val2);
+bool isMin(int val1, int val2);
 
 
 // Data processing & fault detection
@@ -288,18 +293,28 @@ void loop() {
   unsigned long currentTime = millis();
 
   // Data acquisitiion
+  if (currentTime - lastPM25Read >= PM25_SAMPLE_INTERVAL) {
+    lastPM25Read = currentTime;
+    readpm25();
+  }
 
   // data processing and fault detection
 
   // Decision logic
   updateAlerts();
 
-  // --- Section 6: Communication (Joystick, Alert Flashing, Firebase Upload) ---
+  // --- Section 6: Communication (Wi-Fi/Display Check, Joystick, Alert Flashing, Firebase Upload) ---
+  if (currentTime - lastDisplayAndUI >= DISPLAY_INTERVAL) {
+    lastDisplayAndUI = currentTime;
+    checkWiFiConnection();
+    updateDisplay(displayData);
+  }
   updateCommunication(currentTime);
 
   // Data storage
 
   // Testing commands (from tests.cpp)
+#if ENABLE_VERIFICATION_TESTS
   runTestCommands();
 #endif
 }
@@ -496,26 +511,52 @@ bool readsgp30(){
   return true;
 }
 
-bool readpm25(){
-  rawData.pm25.concentration.value = pms.read();
+bool readpm25() {
+  // Poll UART2 for a complete 32-byte PMS7003 frame
+  if (!pms.read()) {
+    // Check if the last valid reading has exceeded the stale timeout (1000 ms * 3 = 3000 ms)
+    if (rawData.pm25.concentration.timestamp > 0 &&
+        (millis() - rawData.pm25.concentration.timestamp > PM25_SAMPLE_INTERVAL * STALE_TIMEOUT_MULTIPLIER)) {
+      rawData.pm25.concentration.valid = false;
+      faultDetections(STALE, false);
+    }
+    return false;
+  }
 
-  safetyAccumulators.pm25UGM3.sum+=rawData.pm25.concentration.value;
-  accumulators.pm25UGM3.sum+=rawData.pm25.concentration.value;
+  // Retrieve atmospheric PM2.5 concentration (ug/m3)
+  float pm25Val = static_cast<float>(pms.getPM2_5_atm());
+
+  // Validate physical sensor bounds (PMS7003 effective range: 0 to 1000 ug/m3)
+  if (!isfinite(pm25Val) || pm25Val < 0.0f || pm25Val > 1000.0f) {
+    rawData.pm25.concentration.valid = false;
+    faultDetections(INVALID, false);
+    return false;
+  }
+
+  // Store valid real-time reading
+  rawData.pm25.concentration.value     = pm25Val;
+  rawData.pm25.concentration.valid     = true;
+  rawData.pm25.concentration.timestamp = millis();
+
+  // Accumulate into 5-second (safety) and 60-second (logging) windows
+  safetyAccumulators.pm25UGM3.sum += pm25Val;
+  accumulators.pm25UGM3.sum       += pm25Val;
   safetyAccumulators.pm25UGM3.count++;
   accumulators.pm25UGM3.count++;
 
-  if (isMax(rawData.pm25.concentration.value, safetyAccumulators.pm25UGM3.maximum)){
-    safetyAccumulators.pm25UGM3.maximum = rawData.pm25.concentration.value;
+  if (isMax(pm25Val, safetyAccumulators.pm25UGM3.maximum)) {
+    safetyAccumulators.pm25UGM3.maximum = pm25Val;
   }
-  if (isMax(rawData.pm25.concentration.value, accumulators.pm25UGM3.maximum)){
-    accumulators.pm25UGM3.maximum=rawData.pm25.concentration.value;
+  if (isMax(pm25Val, accumulators.pm25UGM3.maximum)) {
+    accumulators.pm25UGM3.maximum = pm25Val;
   }
-  if (isMin(rawData.pm25.concentration.value, safetyAccumulators.pm25UGM3.minimum)){
-    safetyAccumulators.pm25UGM3.minimum = rawData.pm25.concentration.value;
+  if (pm25Val < safetyAccumulators.pm25UGM3.minimum) {
+    safetyAccumulators.pm25UGM3.minimum = pm25Val;
   }
-  if (isMin(rawData.pm25.concentration.value, accumulators.pm25UGM3.minimum)){
-    accumulators.pm25UGM3.minimum=rawData.pm25.concentration.value;
+  if (pm25Val < accumulators.pm25UGM3.minimum) {
+    accumulators.pm25UGM3.minimum = pm25Val;
   }
+
   return true;
 }
 
@@ -604,8 +645,9 @@ void clearSafetyAccumulators(){
   safetyAccumulators.humidityPercent.maximum = 0;
   safetyAccumulators.humidityPercent.sum = 0;
   safetyAccumulators.pm25UGM3.count = 0;
-  safetyAccumulators.pm25UGM3.maximum = 0;
-  safetyAccumulators.pm25UGM3.sum = 0;
+  safetyAccumulators.pm25UGM3.maximum = -INFINITY;
+  safetyAccumulators.pm25UGM3.minimum = INFINITY;
+  safetyAccumulators.pm25UGM3.sum = 0.0f;
   safetyAccumulators.temperatureC.count = 0;
   safetyAccumulators.temperatureC.maximum = 0;
   safetyAccumulators.temperatureC.sum = 0;
@@ -626,8 +668,9 @@ void clearAccumulators(){
   accumulators.humidityPercent.maximum = 0;
   accumulators.humidityPercent.sum = 0;
   accumulators.pm25UGM3.count = 0;
-  accumulators.pm25UGM3.maximum = 0;
-  accumulators.pm25UGM3.sum = 0;
+  accumulators.pm25UGM3.maximum = -INFINITY;
+  accumulators.pm25UGM3.minimum = INFINITY;
+  accumulators.pm25UGM3.sum = 0.0f;
   accumulators.temperatureC.count = 0;
   accumulators.temperatureC.maximum = 0;
   accumulators.temperatureC.sum = 0;
