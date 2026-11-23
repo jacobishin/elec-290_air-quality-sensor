@@ -1,14 +1,14 @@
 /* 
 ELEC 290 Section 002-01 - Harmful Gas Monitor Firmware
 
-Hardware (aligned with ELEC290 Pinout.pdf):
+Hardware (aligned with ELEC290 Pinout.pdf + MQ-7 Heater Circuit):
 ESP32-WROVER-E
-SGP30 (I2C)   - eCO2 and TVOC sensor (GPIO 21/22)
-MQ-7 (ADC1)   - CO sensor (GPIO 36)
-DHT22         - Temp and humidity sensor (GPIO 13)
-PMS7003 (UART)- PM2.5 sensor (GPIO 33/19)
-Passive Buzzer- Audio alert (GPIO 25)
-2.0" ST7789   - SPI LCD (GPIO 23/18/5/27/26) + Joystick (GPIO 34/35/32)
+SGP30 (I2C)    - eCO2 and TVOC sensor (GPIO 21/22)
+MQ-7 (ADC1)    - CO sensor (AO via 10k/20k divider -> GPIO 36; S8050 PWM -> GPIO 14)
+DHT22          - Temp and humidity sensor (GPIO 13)
+PMS7003 (UART) - PM2.5 sensor (GPIO 33/19)
+Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
+2.0" ST7789    - SPI LCD (GPIO 23/18/5/27/26) + Joystick (GPIO 34/35/32)
 */
 
 #include <Arduino.h>
@@ -41,6 +41,9 @@ Passive Buzzer- Audio alert (GPIO 25)
 // 1 = enable Serial Monitor verification test suite, 0 = disable for final release
 #define ENABLE_VERIFICATION_TESTS 0
 
+// Comment out to disable 150s heater cycling and run constant 5V polling (1s interval)
+#define USE_MQ7_HEATER_CYCLE
+
 // Wi-Fi & Firebase Realtime Database credentials
 const char* WIFI_SSID           = "jacob";
 const char* WIFI_PASSWORD       = "341145100";
@@ -64,10 +67,15 @@ extern const int JOY_SW_PIN         = 32; // Joystick SW  -> GPIO 32
 const int PMS_RX_PIN                = 33; // PMS7003 UART2 RX -> GPIO 33
 const int PMS_TX_PIN                = 19; // PMS7003 UART2 TX -> GPIO 19
 
-const int MQ7_PIN                   = 36; // MQ-7 AO   -> GPIO 36
+const int MQ7_PIN                   = 36; // MQ-7 AO (via 10k/20k divider) -> GPIO 36
 const int DHT_PIN                   = 13; // DHT22 OUT -> GPIO 13
 
-extern const int BUZZER_PIN         = 25; // Passive Buzzer -> GPIO 25
+extern const int BUZZER_PIN         = 25; // Passive Buzzer -> GPIO 25 (LEDC Ch 4)
+
+// MQ-7 calibration & divider constants
+const float MQ7_DIVIDER_SCALE = 1.5f;     // Undoes 10 kOhm / 20 kOhm divider (set to 1.0f if no divider)
+const float MQ7_RL_OHMS       = 10000.0f; // Onboard 10 kOhm load resistor on 4-pin module
+const float MQ7_R0_OHMS       = 10000.0f; // TODO: Update with measured clean-air R0 calibration value
 
 // Sensor sampling intervals (ms)
 const unsigned long MQ7_SAMPLE_INTERVAL     = 1000;
@@ -75,8 +83,14 @@ const unsigned long SGP30_SAMPLE_INTERVAL   = 1000;
 const unsigned long TEMPHUM_SAMPLE_INTERVAL = 2000; // DHT22 requires >= 2000 ms between reads
 const unsigned long PM25_SAMPLE_INTERVAL    = 1000;
 
-// Stale reading multiplier (stale timeout = sample interval * multiplier)
+// Stale reading multiplier & MQ-7 cycle timeout
 const unsigned long STALE_TIMEOUT_MULTIPLIER = 3;
+#ifdef USE_MQ7_HEATER_CYCLE
+const unsigned long MQ7_CYCLE_MS         = 150000UL; // 60s purge + 90s sense
+const unsigned long MQ7_STALE_TIMEOUT_MS = 160000UL; // > 155s to avoid false stale faults
+#else
+const unsigned long MQ7_STALE_TIMEOUT_MS = MQ7_SAMPLE_INTERVAL * STALE_TIMEOUT_MULTIPLIER;
+#endif
 
 // Data logging & communication intervals (ms)
 const unsigned long LOG_INTERVAL      = 60000; // 60s CSV log window
@@ -213,6 +227,55 @@ unsigned long lastWindowClose  = 0;
 unsigned long lastTransmission = 0;
 
 
+// MQ7 Heater cycle
+#ifdef USE_MQ7_HEATER_CYCLE
+  const int MQ7_HEATER_PIN = 14; // 470 Ohm -> S8050 Middle Pin (Base)
+  const int MQ7_PWM_CH     = 0;  // Safe: buzzer uses LEDC Channel 4
+
+  #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    static void mq7HeaterPwmBegin()          { ledcAttachChannel(MQ7_HEATER_PIN, 1000, 8, MQ7_PWM_CH); }
+    static void mq7HeaterPwmWrite(uint8_t d) { ledcWrite(MQ7_HEATER_PIN, d); }
+  #else
+    static void mq7HeaterPwmBegin() {
+      ledcSetup(MQ7_PWM_CH, 1000, 8);
+      ledcAttachPin(MQ7_HEATER_PIN, MQ7_PWM_CH);
+    }
+    static void mq7HeaterPwmWrite(uint8_t d) { ledcWrite(MQ7_PWM_CH, d); }
+  #endif
+
+  // Manages 150s cycle (60s @ 5V purge, 89.5s @ 1.4V RMS sense).
+  // Returns TRUE once at 149.5s with solid GND for a clean GPIO 36 read.
+  bool mq7ShouldSampleNow(unsigned long now) {
+    static bool initialized      = false;
+    static bool sampledThisCycle = false;
+    static int  lastDuty         = -1;
+
+    if (!initialized) {
+      mq7HeaterPwmBegin();
+      initialized = true;
+    }
+
+    unsigned long cyclePos = now % MQ7_CYCLE_MS;
+
+    if (cyclePos < 60000UL) {
+      if (lastDuty != 255) { mq7HeaterPwmWrite(255); lastDuty = 255; } // 5.0V Purge (100% duty)
+      sampledThisCycle = false;
+      return false;
+    } else if (cyclePos < 149500UL) {
+      if (lastDuty != 22)  { mq7HeaterPwmWrite(22);  lastDuty = 22;  } // 1.4V RMS Sense (8.7% duty)
+      return false;
+    } else if (!sampledThisCycle) {
+      mq7HeaterPwmWrite(255); // Solid GND for 5 ms so AO settles without PWM chopping
+      lastDuty = 255;
+      delay(5);
+      sampledThisCycle = true;
+      return true;
+    }
+    return false;
+  }
+#endif
+
+
 // ============================================================
 /* FUNCTION DECLARATIONS */
 // ============================================================
@@ -273,7 +336,7 @@ void setup() {
 void loop() {
   unsigned long currentTime = millis();
 
-  // --- Section 2: Sensor Acquisition (non-blocking per-sensor timers) ---
+  // --- Section 2: Sensor Acquisition
   readSensors(currentTime);
 
   // --- Section 3 & 4: 5-second Processing, Air-Quality Decision & Display ---
@@ -323,6 +386,10 @@ void initializeSensors() {
   pinMode(MQ7_PIN, INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(MQ7_PIN, ADC_11db);
+
+#ifdef USE_MQ7_HEATER_CYCLE
+  mq7ShouldSampleNow(millis()); // Start 60s 5V purge phase immediately at boot
+#endif
 
   Wire.begin(I2C_SDA_SGP30_PIN, I2C_SCL_SGP30_PIN);
   dht.begin();
@@ -453,10 +520,26 @@ void clearAccumulators() {
 }
 
 void readSensors(unsigned long currentTime) {
+  // MQ-7: Continuous heater cycle when enabled, or 1s polling when disabled
+#ifdef USE_MQ7_HEATER_CYCLE
+  if (mq7ShouldSampleNow(currentTime)) {
+    lastMQ7Read = currentTime;
+    readmq7();
+  } else if (rawData.mq7.coPPM.timestamp > 0 &&
+             (currentTime - rawData.mq7.coPPM.timestamp > MQ7_STALE_TIMEOUT_MS)) {
+    // Only flag stale if a previously valid cycle stops updating (> 160s); ignore initial 149.5s warm-up
+    if (rawData.mq7.coPPM.valid) {
+      rawData.mq7.coPPM.valid = false;
+      faultDetections(STALE, false);
+    }
+  }
+#else
   if (currentTime - lastMQ7Read >= MQ7_SAMPLE_INTERVAL) {
     lastMQ7Read = currentTime;
     readmq7();
   }
+#endif
+
   if (currentTime - lastSGP30Read >= SGP30_SAMPLE_INTERVAL) {
     lastSGP30Read = currentTime;
     readsgp30();
@@ -473,18 +556,36 @@ void readSensors(unsigned long currentTime) {
 }
 
 bool readmq7() {
-  // TODO: Replace raw ADC value with calibrated Rs/R0 -> CO ppm conversion
-  float val = static_cast<float>(analogRead(MQ7_PIN));
-  if (!isfinite(val) || val < 0.0f) {
+  // Average 4 rapid ADC reads during the 5 ms solid-ground window to reduce noise
+  long adcSum = 0;
+  for (int i = 0; i < 4; i++) adcSum += analogRead(MQ7_PIN);
+  float rawADC = adcSum / 4.0f;
+
+  // Undo 10 kOhm / 20 kOhm protection divider to recover actual MQ-7 AO voltage (0..5V)
+  float pinVoltage      = (rawADC / 4095.0f) * 3.3f;
+  float actualAOVoltage = pinVoltage * MQ7_DIVIDER_SCALE;
+
+  if (!isfinite(actualAOVoltage) || actualAOVoltage <= 0.01f || actualAOVoltage >= 4.99f) {
     rawData.mq7.coPPM.valid = false;
     faultDetections(INVALID, false);
     return false;
   }
 
-  rawData.mq7.coPPM.value     = val;
+  // Compute sensor resistance Rs and convert via MQ-7 power-law curve (calibrate MQ7_R0_OHMS in clean air)
+  float rs    = MQ7_RL_OHMS * (5.0f - actualAOVoltage) / actualAOVoltage;
+  float ratio = rs / MQ7_R0_OHMS;
+  float coPPM = 99.042f * powf(ratio, -1.518f);
+
+  if (!isfinite(coPPM) || coPPM < 0.0f) {
+    rawData.mq7.coPPM.valid = false;
+    faultDetections(INVALID, false);
+    return false;
+  }
+
+  rawData.mq7.coPPM.value     = coPPM;
   rawData.mq7.coPPM.valid     = true;
   rawData.mq7.coPPM.timestamp = millis();
-  addSample(safetyAccumulators.coPPM, accumulators.coPPM, val);
+  addSample(safetyAccumulators.coPPM, accumulators.coPPM, coPPM);
   return true;
 }
 
@@ -522,7 +623,7 @@ bool readpm25() {
     return false;
   }
 
-  float pm25Val = static_cast<float>(pms.getPM2_5_atm());
+  float pm25Val = static_cast<float>(pms.getPM2_5_ATM());
   if (!isfinite(pm25Val) || pm25Val < 0.0f || pm25Val > 1000.0f) {
     rawData.pm25.concentration.valid = false;
     faultDetections(INVALID, false);
@@ -585,22 +686,47 @@ static void finalizeChannel(const SensorTotal &src, AverageData &dst) {
   }
 }
 
+// Holds the last valid CO reading across 5s & 60s windows between 150s MQ-7 heater cycles
+static void finalizeCOChannel(const SensorTotal &src, AverageData &dst, unsigned long now) {
+  if (src.count > 0) {
+    finalizeChannel(src, dst);
+    return;
+  }
+
+#ifdef USE_MQ7_HEATER_CYCLE
+  if (rawData.mq7.coPPM.valid && isfinite(rawData.mq7.coPPM.value) &&
+      (now - rawData.mq7.coPPM.timestamp <= MQ7_STALE_TIMEOUT_MS)) {
+    dst.average     = rawData.mq7.coPPM.value;
+    dst.maximum     = rawData.mq7.coPPM.value;
+    dst.sampleCount = 1; // Held valid sample from current 150s thermal cycle
+    dst.valid       = true;
+    return;
+  }
+#endif
+
+  // Initial 149.5s warm-up or sensor stale/invalid
+  dst.average     = NAN;
+  dst.maximum     = NAN;
+  dst.sampleCount = 0;
+  dst.valid       = false;
+}
+
 // option == true -> finalize 60s loggedData; option == false -> finalize 5s displayData
 int processData(bool option) {
   unsigned long now = millis();
 
   if (option) {
     loggedData.windowEndTimestamp = now;
-    finalizeChannel(accumulators.coPPM,           loggedData.coPPM);
-    finalizeChannel(accumulators.tvocPPB,         loggedData.tvocPPB);
-    finalizeChannel(accumulators.eco2PPM,         loggedData.eco2PPM);
-    finalizeChannel(accumulators.temperatureC,    loggedData.temperatureC);
-    finalizeChannel(accumulators.humidityPercent, loggedData.humidityPercent);
-    finalizeChannel(accumulators.pm25UGM3,        loggedData.pm25UGM3);
+    finalizeCOChannel(accumulators.coPPM,          loggedData.coPPM,           now);
+    finalizeChannel(accumulators.tvocPPB,          loggedData.tvocPPB);
+    finalizeChannel(accumulators.eco2PPM,          loggedData.eco2PPM);
+    finalizeChannel(accumulators.temperatureC,     loggedData.temperatureC);
+    finalizeChannel(accumulators.humidityPercent,  loggedData.humidityPercent);
+    finalizeChannel(accumulators.pm25UGM3,         loggedData.pm25UGM3);
     clearAccumulators();
   } else {
     displayData.windowEndTimestamp = now;
-    finalizeChannel(safetyAccumulators.coPPM,           displayData.coPPM);
+    finalizeCOChannel(safetyAccumulators.coPPM,         displayData.coPPM,           now);
     finalizeChannel(safetyAccumulators.tvocPPB,         displayData.tvocPPB);
     finalizeChannel(safetyAccumulators.eco2PPM,         displayData.eco2PPM);
     finalizeChannel(safetyAccumulators.temperatureC,    displayData.temperatureC);
@@ -797,7 +923,7 @@ bool sendJsonToFirebase(const char* jsonPayload) {
   if (!http.begin(client, fullUrl)) return false;
 
   http.addHeader("Content-Type", "application/json");
-  int code = http.POST(reinterpret_cast<const uint8_t*>(jsonPayload), strlen(jsonPayload));
+  int code = http.POST((uint8_t*)jsonPayload, strlen(jsonPayload));
   http.end();
   return (code >= 200 && code < 300);
 }
