@@ -28,9 +28,11 @@ LCD
 #include <DHT.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <PMS7003.h>
 
 #include "local_communication.h" // Display, Joystick, and Buzzer module
 #include "tests.h"               // Testing helper functions
+
 
 
 // ============================================================
@@ -165,6 +167,7 @@ struct RawSensorData {
 struct SensorTotal {
   float sum = 0.0f;
   float maximum = -INFINITY;
+  float minimum = INFINITY;
   unsigned int count = 0;
 };
 
@@ -200,6 +203,7 @@ String activeAlertMessage = "Normal";
 // Hardware instances (ST7789 lcd instance is managed inside local_communication.cpp)
 Adafruit_SGP30 sgp;
 DHT dht(DHT_PIN, DHT22);
+GuL::PMS7003 pms(Serial2); 
 
 // byte offset for last cloud upload in csv file
 Preferences syncPrefs;
@@ -232,9 +236,6 @@ void initializeCommunication();
 void initializeAlerts();
 
 // Data acquisition
-void readSensors();
-void accumulateData();
-bool isMax(float val1, float val2);
 void acquireMQ7(unsigned long currentTime);
 void acquireSGP30(unsigned long currentTime);
 void acquireTempHumidity(unsigned long currentTime);
@@ -276,39 +277,29 @@ void setup() {
   updateDisplay(displayData);
   Serial.println("Harmful Gas Monitor Started.\n");
 }
-
+  unsigned long lastTime1 = 0;
+  unsigned long lastTimetemphum = 0;
+  unsigned long display = 0;
+  unsigned long send = 0;
 // ============================================================
 /* MAIN LOOP */
 // ============================================================
 void loop() {
   unsigned long currentTime = millis();
 
-  // --- Section 2: Data Acquisition ---
-  // (Teammates: call readSensors() / accumulateData() on sensor intervals here)
+  // Data acquisitiion
 
-  // --- Section 3 & 4: 5-Second Display & Wi-Fi Window ---
-  if (currentTime - lastDisplayAndUI >= DISPLAY_INTERVAL) {
-    lastDisplayAndUI = currentTime;
-    // (Teammates: call processData(false) and evaluateAirQuality() here)
-    checkWiFiConnection();
-    updateDisplay(displayData);
-  }
+  // data processing and fault detection
 
-  // --- Section 3 & 5: 60-Second Storage Window ---
-  if (currentTime - lastWindowClose >= LOG_INTERVAL) {
-    lastWindowClose = currentTime;
-    // (Teammates: call processData(true) here)
-    storeData(loggedData);
-  }
-
-  // --- Section 4: Decision Logic (Buzzer) ---
+  // Decision logic
   updateAlerts();
 
   // --- Section 6: Communication (Joystick, Alert Flashing, Firebase Upload) ---
   updateCommunication(currentTime);
 
-  // --- Verification & Testing Suite (tests.cpp) ---
-#if ENABLE_VERIFICATION_TESTS
+  // Data storage
+
+  // Testing commands (from tests.cpp)
   runTestCommands();
 #endif
 }
@@ -416,40 +407,7 @@ void readSensors(){
   //sensorAccumulator struct which that raw data is added in sum, and count++ to later be used
   //in data processing
   
-  //read in all data
-  try {
-    rawData.mq7.coPPM.value = analogRead(MQ7_PIN);
-    
-
-    if (!sgp.IAQmeasure()){ //IAQmeasure return value is a bool
-      faults.readingInvalid.num++;
-      faultDetections(STORAGE, false);
-      throw ("SGP30 reading returned false");
-    }
-    rawData.sgp30.eco2PPM.value = sgp.eCO2; //i think this is in ppm
-    rawData.sgp30.tvocPPB.value = sgp.TVOC; //i think this is in ppb
-    
-    float tempHumid = dht.readHumidity(); //in % - water vapor in air as a percent of max the air can hold at temp
-    float tempTemper = dht.readTemperature(); //in degree C
-    if (isnan(tempHumid)){
-      throw ("Humidity sensor nan");
-    }
-    
-    rawData.tempHum.humidityPercent.value = tempHumid;
-    rawData.tempHum.temperatureC.value = tempTemper;
-    if (isnan(tempTemper)){
-      throw ("Temperature sensor nan");
-    }
-    
-
-  }
-  catch (const char* msg){
-    //!!!!!!!!!!!!!!!!!this should later do something with fault management
-    Serial.print(msg);
-  } 
-
-
-  
+  //read in all data 
 }
 
 /// @brief reads in data from each sensor, storing as a float, then adds the value to
@@ -458,77 +416,225 @@ void readSensors(){
 
 ///        This is simply reading in values and accumulating it into categories.
 ///        processData will have the average values that get displayed and stored
-void accumulateData(){
-  //safetyAccumulators is for 5 second display update
-  //accumulators is for 60 second file write
-  float readInData = rawData.mq7.coPPM.value;
+bool readmq7() {
+  rawData.mq7.coPPM.value = analogRead(MQ7_PIN);
+  int r = 10000;
 
-  safetyAccumulators.coPPM.sum += readInData;
-  accumulators.coPPM.sum += readInData;
-  if (isMax(readInData, safetyAccumulators.coPPM.sum)){
-    safetyAccumulators.coPPM.maximum = readInData;
-  }
-  if (isMax(readInData, accumulators.coPPM.sum)){
-    accumulators.coPPM.maximum = readInData;
-  }
 
-  readInData = rawData.sgp30.eco2PPM.value;
+  rawData.mq7.coPPM.value;
+  // more needs to be done before summing
 
-  safetyAccumulators.eco2PPM.sum+=readInData;
-  accumulators.eco2PPM.sum+=readInData;
-  if (isMax(readInData, safetyAccumulators.eco2PPM.sum)){
-    safetyAccumulators.eco2PPM.maximum = readInData;
+  safetyAccumulators.coPPM.sum += rawData.mq7.coPPM.value;
+  accumulators.coPPM.sum += rawData.mq7.coPPM.value;
+  safetyAccumulators.coPPM.count++;
+  accumulators.coPPM.count++;
+  if (isMax(rawData.mq7.coPPM.value, safetyAccumulators.coPPM.maximum)){
+    safetyAccumulators.coPPM.maximum = rawData.mq7.coPPM.value;
   }
-  if (isMax(readInData, accumulators.eco2PPM.sum)){
-    accumulators.eco2PPM.maximum=readInData;
+  if (isMax(rawData.mq7.coPPM.value, accumulators.coPPM.maximum)){
+    accumulators.coPPM.maximum = rawData.mq7.coPPM.value;
   }
 
-  readInData = rawData.sgp30.tvocPPB.value;
-
-  safetyAccumulators.tvocPPB.sum+=readInData;
-  accumulators.tvocPPB.sum+=readInData;
-  if (isMax(readInData, safetyAccumulators.tvocPPB.sum)){
-    safetyAccumulators.tvocPPB.maximum = readInData;
+  if (isMin(rawData.mq7.coPPM.value, safetyAccumulators.coPPM.minimum)){
+    safetyAccumulators.coPPM.minimum = rawData.mq7.coPPM.value;
   }
-  if (isMax(readInData, accumulators.tvocPPB.sum)){
-    accumulators.tvocPPB.maximum=readInData;
+  if (isMin(rawData.mq7.coPPM.value, accumulators.coPPM.minimum)){
+    accumulators.coPPM.minimum= rawData.mq7.coPPM.value;
   }
+  return true;
+}
 
-  readInData = rawData.pm25.concentration.value;
-
-  safetyAccumulators.pm25UGM3.sum+=readInData;
-  accumulators.pm25UGM3.sum+=readInData;
-  if (isMax(readInData, safetyAccumulators.pm25UGM3.sum)){
-    safetyAccumulators.pm25UGM3.maximum = readInData;
+bool readsgp30(){
+  
+  if (!sgp.IAQmeasure()){ //IAQmeasure return value is a bool
+      faults.readingInvalid.num++;
+      return false;
+      //faultDetections(STORAGE, false);
   }
-  if (isMax(readInData, accumulators.pm25UGM3.sum)){
-    accumulators.pm25UGM3.maximum=readInData;
-  }
+  rawData.sgp30.eco2PPM.value = sgp.eCO2; //i think this is in ppm
 
-  readInData = rawData.tempHum.humidityPercent.value;
+  safetyAccumulators.eco2PPM.sum+=rawData.sgp30.eco2PPM.value;
+  accumulators.eco2PPM.sum+=rawData.sgp30.eco2PPM.value;
+  safetyAccumulators.eco2PPM.count++;
+  accumulators.eco2PPM.count++;
 
-  safetyAccumulators.humidityPercent.sum+=readInData;
-  accumulators.humidityPercent.sum+=readInData;
-  if (isMax(readInData, safetyAccumulators.humidityPercent.sum)){
-    safetyAccumulators.humidityPercent.maximum = readInData;
+  if (isMax(rawData.sgp30.eco2PPM.value, safetyAccumulators.eco2PPM.maximum)){
+    safetyAccumulators.eco2PPM.maximum = rawData.sgp30.eco2PPM.value;
   }
-  if (isMax(readInData, accumulators.humidityPercent.sum)){
-    accumulators.humidityPercent.maximum=readInData;
+  if (isMax(rawData.sgp30.eco2PPM.value, accumulators.eco2PPM.maximum)){
+    accumulators.eco2PPM.maximum= rawData.sgp30.eco2PPM.value;
   }
 
-  readInData = rawData.tempHum.temperatureC.value;
+  if (isMin(rawData.sgp30.eco2PPM.value, safetyAccumulators.eco2PPM.minimum)){
+    safetyAccumulators.eco2PPM.minimum = rawData.sgp30.eco2PPM.value;
+  }
+  if (isMin(rawData.sgp30.eco2PPM.value, accumulators.eco2PPM.minimum)){
+    accumulators.eco2PPM.minimum= rawData.sgp30.eco2PPM.value;
+  }
 
-  safetyAccumulators.temperatureC.sum+=readInData;
-  accumulators.temperatureC.sum+=readInData;
-  if (isMax(readInData, safetyAccumulators.temperatureC.sum)){
-    safetyAccumulators.temperatureC.maximum = readInData;
+  rawData.sgp30.tvocPPB.value = sgp.TVOC; //i think this is in ppb
+    
+  safetyAccumulators.tvocPPB.sum+=rawData.sgp30.tvocPPB.value;
+  accumulators.tvocPPB.sum+=rawData.sgp30.tvocPPB.value;
+  safetyAccumulators.tvocPPB.count++;
+  accumulators.tvocPPB.count++;
+  
+  if (isMax(rawData.sgp30.tvocPPB.value, safetyAccumulators.tvocPPB.maximum)){
+    safetyAccumulators.tvocPPB.maximum = rawData.sgp30.tvocPPB.value;
   }
-  if (isMax(readInData, accumulators.temperatureC.sum)){
-    accumulators.temperatureC.maximum=readInData;
+  if (isMax(rawData.sgp30.tvocPPB.value, accumulators.tvocPPB.maximum)){
+    accumulators.tvocPPB.maximum=rawData.sgp30.tvocPPB.value;
   }
+
+  if (isMin(rawData.sgp30.tvocPPB.value, safetyAccumulators.tvocPPB.minimum)){
+    safetyAccumulators.tvocPPB.minimum = rawData.sgp30.tvocPPB.value;
+  }
+  if (isMin(rawData.sgp30.tvocPPB.value, accumulators.tvocPPB.minimum)){
+    accumulators.tvocPPB.minimum=rawData.sgp30.tvocPPB.value;
+  }
+
+  return true;
+}
+
+bool readpm25(){
+  rawData.pm25.concentration.value = pms.read();
+
+  safetyAccumulators.pm25UGM3.sum+=rawData.pm25.concentration.value;
+  accumulators.pm25UGM3.sum+=rawData.pm25.concentration.value;
+  safetyAccumulators.pm25UGM3.count++;
+  accumulators.pm25UGM3.count++;
+
+  if (isMax(rawData.pm25.concentration.value, safetyAccumulators.pm25UGM3.maximum)){
+    safetyAccumulators.pm25UGM3.maximum = rawData.pm25.concentration.value;
+  }
+  if (isMax(rawData.pm25.concentration.value, accumulators.pm25UGM3.maximum)){
+    accumulators.pm25UGM3.maximum=rawData.pm25.concentration.value;
+  }
+  if (isMin(rawData.pm25.concentration.value, safetyAccumulators.pm25UGM3.minimum)){
+    safetyAccumulators.pm25UGM3.minimum = rawData.pm25.concentration.value;
+  }
+  if (isMin(rawData.pm25.concentration.value, accumulators.pm25UGM3.minimum)){
+    accumulators.pm25UGM3.minimum=rawData.pm25.concentration.value;
+  }
+  return true;
+}
+
+bool readhum(){
+
+  rawData.tempHum.humidityPercent.value = dht.readHumidity();
+  if (rawData.tempHum.humidityPercent.value < 15){
+    faultDetections(INVALID, false);
+    return false;
+  }
+
+  safetyAccumulators.humidityPercent.sum+=rawData.tempHum.humidityPercent.value;
+  accumulators.humidityPercent.sum+=rawData.tempHum.humidityPercent.value;
+  safetyAccumulators.humidityPercent.count++;
+  accumulators.humidityPercent.count++;
+  
+  if (isMax(rawData.tempHum.humidityPercent.value, safetyAccumulators.humidityPercent.maximum)){
+    safetyAccumulators.humidityPercent.maximum = rawData.tempHum.humidityPercent.value;
+  }
+  if (isMax(rawData.tempHum.humidityPercent.value, accumulators.humidityPercent.maximum)){
+    accumulators.humidityPercent.maximum=rawData.tempHum.humidityPercent.value;
+  }
+
+  if (isMin(rawData.tempHum.humidityPercent.value, safetyAccumulators.humidityPercent.minimum)){
+    safetyAccumulators.humidityPercent.minimum = rawData.tempHum.humidityPercent.value;
+  }
+  if (isMin(rawData.tempHum.humidityPercent.value, accumulators.humidityPercent.minimum)){
+    accumulators.humidityPercent.minimum=rawData.tempHum.humidityPercent.value;
+  }
+  return 1;
+}
+
+bool readtemp(){
+
+  rawData.tempHum.temperatureC.value = dht.readTemperature();
+  if (rawData.tempHum.temperatureC.value < 5){
+      faultDetections(INVALID, false);
+      return false;
+  }
+  safetyAccumulators.temperatureC.sum+=rawData.tempHum.temperatureC.value;
+  accumulators.temperatureC.sum+=rawData.tempHum.temperatureC.value;
+  safetyAccumulators.temperatureC.count++;
+  accumulators.temperatureC.count++;
+  
+  if (isMax(rawData.tempHum.temperatureC.value, safetyAccumulators.temperatureC.maximum)){
+    safetyAccumulators.temperatureC.maximum = rawData.tempHum.temperatureC.value;
+  }
+  if (isMax(rawData.tempHum.temperatureC.value, accumulators.temperatureC.maximum)){
+    accumulators.temperatureC.maximum=rawData.tempHum.temperatureC.value;
+  }
+
+  if (isMin(rawData.tempHum.temperatureC.value, safetyAccumulators.temperatureC.minimum)){
+    safetyAccumulators.temperatureC.minimum = rawData.tempHum.temperatureC.value;
+  }
+  if (isMin(rawData.tempHum.temperatureC.value, accumulators.temperatureC.minimum)){
+    accumulators.temperatureC.minimum=rawData.tempHum.temperatureC.value;
+  }
+
+  return true;
 }
 
 
+void accumulateData(bool fiveSec, bool sixtySec){
+  //safetyAccumulators is for 5 second display update
+  //accumulators is for 60 second file write
+  if (fiveSec){
+    processData(0);
+    clearSafetyAccumulators();
+  }
+  if(sixtySec){
+    processData(1);
+    clearAccumulators();
+  }
+
+}
+
+/// @brief resets safety accumulators
+void clearSafetyAccumulators(){
+  safetyAccumulators.coPPM.count = 0;
+  safetyAccumulators.coPPM.maximum = 0;
+  safetyAccumulators.coPPM.sum = 0;
+  safetyAccumulators.eco2PPM.count = 0;
+  safetyAccumulators.eco2PPM.maximum = 0;
+  safetyAccumulators.eco2PPM.sum = 0;
+  safetyAccumulators.humidityPercent.count = 0;
+  safetyAccumulators.humidityPercent.maximum = 0;
+  safetyAccumulators.humidityPercent.sum = 0;
+  safetyAccumulators.pm25UGM3.count = 0;
+  safetyAccumulators.pm25UGM3.maximum = 0;
+  safetyAccumulators.pm25UGM3.sum = 0;
+  safetyAccumulators.temperatureC.count = 0;
+  safetyAccumulators.temperatureC.maximum = 0;
+  safetyAccumulators.temperatureC.sum = 0;
+  safetyAccumulators.tvocPPB.count = 0;
+  safetyAccumulators.tvocPPB.maximum = 0;
+  safetyAccumulators.tvocPPB.sum = 0;
+}
+
+/// @brief resets accumulators
+void clearAccumulators(){
+  accumulators.coPPM.count = 0;
+  accumulators.coPPM.maximum = 0;
+  accumulators.coPPM.sum = 0;
+  accumulators.eco2PPM.count = 0;
+  accumulators.eco2PPM.maximum = 0;
+  accumulators.eco2PPM.sum = 0;
+  accumulators.humidityPercent.count = 0;
+  accumulators.humidityPercent.maximum = 0;
+  accumulators.humidityPercent.sum = 0;
+  accumulators.pm25UGM3.count = 0;
+  accumulators.pm25UGM3.maximum = 0;
+  accumulators.pm25UGM3.sum = 0;
+  accumulators.temperatureC.count = 0;
+  accumulators.temperatureC.maximum = 0;
+  accumulators.temperatureC.sum = 0;
+  accumulators.tvocPPB.count = 0;
+  accumulators.tvocPPB.maximum = 0;
+  accumulators.tvocPPB.sum = 0;
+}
 
 /// @brief returns true if val1 > val2 
 /// @param val1 
@@ -538,9 +644,47 @@ bool isMax(float val1, float val2){
   return (val1 > val2) ? true: false;
 }
 
+/// @brief returns true if val1 < val2
+/// @param val1 
+/// @param val2 
+/// @return bool
+bool isMin(int val1, int val2){
+  return (val1 < val2) ? true: false;
+}
+
 // ============================================================
 /* DATA PROCESSING & FAULT DETECTION */
 // ============================================================
+
+//!!Copy and pasted here so I don't have to scroll all the way back up 
+/*struct SensorTotal {
+  float sum = 0.0f;
+  float maximum = -INFINITY;
+  unsigned int count = 0;
+};
+struct SensorAccumulators {
+  SensorTotal coPPM;
+  SensorTotal tvocPPB;
+  SensorTotal eco2PPM;
+  SensorTotal temperatureC;
+  SensorTotal humidityPercent;
+  SensorTotal pm25UGM3;
+};
+struct AverageData {
+  float average = NAN;
+  float maximum = NAN;
+  unsigned int sampleCount = 0;
+  bool valid = false;
+};
+struct ProcessedData {
+  unsigned long windowEndTimestamp = 0;
+  AverageData coPPM;
+  AverageData tvocPPB;
+  AverageData eco2PPM;
+  AverageData temperatureC;
+  AverageData humidityPercent;
+  AverageData pm25UGM3;
+};*/
 
 /// @brief processes the raw data into averaged data. If this is called with 
 ///        option = true, process the 60 second data. else, process the 5 second data.
@@ -556,7 +700,7 @@ int processData(bool option){
     loggedData.eco2PPM.average=accumulators.eco2PPM.sum/accumulators.eco2PPM.count;
     loggedData.eco2PPM.maximum=accumulators.eco2PPM.maximum;
     //add windowendtimestamp
-
+    
     loggedData.humidityPercent.average=accumulators.humidityPercent.sum/accumulators.humidityPercent.count;
     loggedData.humidityPercent.maximum=accumulators.humidityPercent.maximum;
     //add windowendtimestamp
@@ -571,6 +715,7 @@ int processData(bool option){
 
     loggedData.tvocPPB.average=accumulators.tvocPPB.sum/accumulators.tvocPPB.count;
     loggedData.tvocPPB.maximum=accumulators.tvocPPB.maximum;
+    clearAccumulators();
     //add windowendtimestamp
     
     //maybe call storedata here?
@@ -581,21 +726,36 @@ int processData(bool option){
   
     displayData.eco2PPM.average=safetyAccumulators.eco2PPM.sum/safetyAccumulators.eco2PPM.count;
     displayData.eco2PPM.maximum=safetyAccumulators.eco2PPM.maximum;
-  
+    if (displayData.eco2PPM.average = displayData.eco2PPM.maximum){
+      faultDetections(STALE, false);
+    }
+
     displayData.humidityPercent.average=safetyAccumulators.humidityPercent.sum/safetyAccumulators.humidityPercent.count;
     displayData.humidityPercent.maximum=safetyAccumulators.humidityPercent.maximum;
-  
+    if (displayData.humidityPercent.average = displayData.humidityPercent.maximum){
+      faultDetections(STALE, false);
+    }
+
     displayData.pm25UGM3.average=safetyAccumulators.pm25UGM3.sum/safetyAccumulators.pm25UGM3.count;
     displayData.pm25UGM3.maximum=safetyAccumulators.pm25UGM3.maximum;
-  
+    if (displayData.pm25UGM3.average = displayData.pm25UGM3.maximum){
+      faultDetections(STALE, false);
+    }
+
     displayData.temperatureC.average=safetyAccumulators.temperatureC.sum/safetyAccumulators.temperatureC.count;
     displayData.temperatureC.maximum=safetyAccumulators.temperatureC.maximum;
+    if (displayData.temperatureC.average = displayData.temperatureC.maximum){
+      faultDetections(STALE, false);
+    }
 
     displayData.tvocPPB.average=safetyAccumulators.tvocPPB.sum/safetyAccumulators.tvocPPB.count;
     displayData.tvocPPB.maximum=safetyAccumulators.tvocPPB.maximum;
-
+    if (displayData.tvocPPB.average = displayData.tvocPPB.maximum){
+      faultDetections(STALE, false);
+    }
+    updateDisplay(displayData);
+    clearSafetyAccumulators();
     //maybe call updatedisplay?
-    return 0;
 }
 
 /// @brief Increases the number of faults, and determines if faults should be updated 
@@ -674,7 +834,6 @@ int faultDetections(faultenum fault, bool override){
     }  
     //update LCD
  }
- return 0;
 }
 
 // ============================================================
