@@ -44,7 +44,7 @@ LCD
 const char* WIFI_SSID = "jacob";
 const char* WIFI_PASSWORD = "341145100";
 
-const char* FIREBASE_URL ="https://gas-monitor-6e3eb-default-rtdb.firebaseio.com/devices/monitor-01/readings.json"; // idk if itll be a url or an endpoint
+const char* FIREBASE_URL ="https://gas-monitor-6e3eb-default-rtdb.firebaseio.com/devices/testmonitor/readings.json"; // idk if itll be a url or an endpoint
 const char* FIREBASE_AUTH_TOKEN = "1YfvkBGVE4v2KK5FFd7N1QkqjXl5opGkmFKVwLUd"; // idk if actual authentication is necessary
 
 // Pin assignments (ESP32 GPIO numbers from schematic U1)
@@ -105,14 +105,14 @@ const char* CSV_HEADER = "timestamp_ms,alert_active,"
 
 // Air quality thresholds (-1.0f = unconfigured placeholder)
 extern const float C0_THRESHOLD1_PPM   = -1.0f;
-extern const float TVOC_THRESHOLD1_PPB = -1.0f;
+// extern const float TVOC_THRESHOLD1_PPB = -1.0f;
 extern const float ECO2_THRESHOLD1_PPM = -1.0f;
-extern const float PM25_THRESHOLD1_UGM3 = -1.0f;
+// extern const float PM25_THRESHOLD1_UGM3 = -1.0f;
 
 extern const float C0_THRESHOLD2_PPM   =  200;
-extern const float TVOC_THRESHOLD2_PPB = -1.0f;
+// extern const float TVOC_THRESHOLD2_PPB = -1.0f;
 extern const float ECO2_THRESHOLD2_PPM = 4000;
-extern const float PM25_THRESHOLD2_UGM3 = -1.0f;
+// extern const float PM25_THRESHOLD2_UGM3 = -1.0f;
 
 const int allowedSensorFaults    = 1;
 const int allowedInvalidReadings = 1;
