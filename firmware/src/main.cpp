@@ -181,6 +181,19 @@ struct SensorAccumulators {
   SensorTotal pm25UGM3;
 };
 
+// FreeRTOS IPC payloads (Sub-Option 1B: Core 1 owns flash, Core 0 owns HTTPS)
+struct UploadJob {
+  char json[512];
+  size_t nextOffset;
+  uint8_t fileIndex;
+};
+
+struct UploadResult {
+  bool success;
+  size_t nextOffset;
+  uint8_t fileIndex;
+};
+
 
 // ============================================================
 /* GLOBAL VARIABLES */
@@ -200,7 +213,7 @@ bool wifiConnected        = false;
 bool dangerAlertActive    = false;
 String activeAlertMessage = "Normal";
 
-// Hardware instances (ST7789 lcd instance is managed inside local_communication.cpp)
+// Hardware instances
 Adafruit_SGP30 sgp;
 DHT dht(DHT_PIN, DHT22);
 GuL::PMS7003 pms(Serial2); 
@@ -212,6 +225,11 @@ size_t lastUploadedByteOffset = 0;
 size_t currentLogFileSize     = 0;
 bool timeSyncedThisBoot       = false;
 unsigned long bootEpochSec    = 0;
+
+// FreeRTOS Core 0 Firebase worker handles
+static QueueHandle_t firebaseUploadQueue = nullptr;
+static QueueHandle_t firebaseResultQueue = nullptr;
+static bool uploadInFlight               = false;
 
 // Non-blocking timers
 unsigned long lastMQ7Read      = 0;
@@ -263,8 +281,9 @@ void storeData(const ProcessedData &data);
 
 
 // Communication
-bool csvLineToJson(const String &csvLine, String &jsonOut);
-bool sendJsonToFirebase(const String &jsonPayload);
+bool csvLineToJson(const String &csvLine, char* jsonOut, size_t jsonOutSize);
+bool sendJsonToFirebase(const char* jsonPayload);
+void firebaseUploadTask(void* param);
 void updateCommunication(unsigned long currentTime);
 void updateDisplay(const ProcessedData &data);
 void transmitData();
@@ -303,7 +322,7 @@ void loop() {
   // Decision logic
   updateAlerts();
 
-  // --- Section 6: Communication (Wi-Fi/Display Check, Joystick, Alert Flashing, Firebase Upload) ---
+  // --- Section 6: Communication (Wi-Fi/Display Check, Joystick, Alert Flashing, Async Firebase Upload) ---
   if (currentTime - lastDisplayAndUI >= DISPLAY_INTERVAL) {
     lastDisplayAndUI = currentTime;
     checkWiFiConnection();
@@ -403,6 +422,21 @@ void initializeCommunication() {
 
   // Configure background NTP time synchronization (UTC / Unix Epoch)
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  // Create 1-slot IPC queues and launch Core 0 HTTPS upload worker (8 KB stack for TLS)
+  firebaseUploadQueue = xQueueCreate(1, sizeof(UploadJob));
+  firebaseResultQueue = xQueueCreate(1, sizeof(UploadResult));
+  if (firebaseUploadQueue && firebaseResultQueue) {
+    xTaskCreatePinnedToCore(
+      firebaseUploadTask,
+      "firebase_tx",
+      8192,
+      nullptr,
+      1,
+      nullptr,
+      0
+    );
+  }
 }
 
 void initializeAlerts() {
@@ -968,7 +1002,7 @@ void storeData(const ProcessedData &data) {
 // ============================================================
 
 // takes a single 20-column comma-separated row from the CSV file and converts it into JSON for Firebase
-bool csvLineToJson(const String &csvLine, String &jsonOut) {
+bool csvLineToJson(const String &csvLine, char* jsonOut, size_t jsonOutSize) {
   if (csvLine.startsWith("timestamp_")) return false;
 
   // copy the csv line into a temporary char buffer and split it at every comma into 20 tokens
@@ -989,15 +1023,14 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
 
   // write the timestamp at the start of the json (tok[1] / alert_active is intentionally omitted)
   const char* keys[6] = {"co", "tvoc", "eco2", "temp", "hum", "pm25"};
-  char jsonBuf[512];
-  int pos = snprintf(jsonBuf, sizeof(jsonBuf), "{\"timestamp_ms\":%lu", ts);
+  int pos = snprintf(jsonOut, jsonOutSize, "{\"timestamp_ms\":%lu", ts);
 
   // ============================================================
   // ORIGINAL: Nested JSON (subfields: avg, count, valid)
   // ============================================================
   for (int i = 0; i < 6; i++) {
     int b = 2 + (i * 3);
-    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
+    pos += snprintf(jsonOut + pos, jsonOutSize - pos,
                     ",\"%s\":{\"avg\":%s,\"count\":%s,\"valid\":%s}",
                     keys[i],
                     strcmp(tok[b], "NAN") ? tok[b] : "null",
@@ -1010,7 +1043,7 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
   // ============================================================
   for (int i = 0; i < 6; i++) {
     int b = 2 + (i * 3);
-    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
+    pos += snprintf(jsonOut + pos, jsonOutSize - pos,
                     ",\"%s_avg\":%s,\"%s_count\":%s,\"%s_valid\":%s",
                     keys[i], strcmp(tok[b], "NAN") ? tok[b] : "null",
                     keys[i], tok[b + 1],
@@ -1018,15 +1051,14 @@ bool csvLineToJson(const String &csvLine, String &jsonOut) {
   }
   */
 
-  snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "}");
-  jsonOut = jsonBuf;
+  snprintf(jsonOut + pos, jsonOutSize - pos, "}");
   return true;
 }
 
-// sends the formatted JSON string to the Firebase Realtime Database over HTTPS POST and returns true if accepted
-bool sendJsonToFirebase(const String &jsonPayload) {
+// runs on Core 0: sends the formatted JSON string to Firebase over HTTPS POST and returns true if accepted
+bool sendJsonToFirebase(const char* jsonPayload) {
   if (strlen(FIREBASE_URL) == 0) {
-    Serial.println("Sent to firebase:" + jsonPayload);
+    Serial.printf("Sent to firebase: %s\n", jsonPayload);
     return true;
   }
 
@@ -1035,20 +1067,50 @@ bool sendJsonToFirebase(const String &jsonPayload) {
 
   HTTPClient http;
   http.setReuse(true);
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+
   String fullUrl = String(FIREBASE_URL) + (strlen(FIREBASE_AUTH_TOKEN) ? ("?auth=" + String(FIREBASE_AUTH_TOKEN)) : "");
   if (!http.begin(client, fullUrl)) return false;
 
   http.addHeader("Content-Type", "application/json");
-  int code = http.POST(jsonPayload);
+  int code = http.POST(reinterpret_cast<const uint8_t*>(jsonPayload), strlen(jsonPayload));
   http.end();
   return (code >= 200 && code < 300);
 }
 
-// polls the joystick for responsive navigation and triggers transmitData() every 2 seconds whenever wi-fi is connected
+// Core 0 FreeRTOS worker task: blocks until Core 1 queues an upload job, performs HTTPS POST, returns result
+void firebaseUploadTask(void* param) {
+  UploadJob job;
+  for (;;) {
+    if (xQueueReceive(firebaseUploadQueue, &job, portMAX_DELAY) == pdTRUE) {
+      bool ok = sendJsonToFirebase(job.json);
+      UploadResult res = { ok, job.nextOffset, job.fileIndex };
+      xQueueSend(firebaseResultQueue, &res, portMAX_DELAY);
+    }
+  }
+}
+
+// Core 1: polls joystick, harvests completed Core 0 uploads, and dispatches the next CSV row every TRANSMIT_INTERVAL
 void updateCommunication(unsigned long currentTime) {
   handleJoystickInput(currentTime, displayData);
 
-  if (wifiConnected && (currentTime - lastTransmission >= TRANSMIT_INTERVAL)) {
+  // Check if Core 0 finished the in-flight HTTPS upload (non-blocking)
+  if (uploadInFlight && firebaseResultQueue) {
+    UploadResult res;
+    if (xQueueReceive(firebaseResultQueue, &res, 0) == pdTRUE) {
+      uploadInFlight = false;
+      lastTransmission = currentTime;
+      // Advance NVS bookmark only if upload succeeded and log file did not rotate mid-upload
+      if (res.success && res.fileIndex == activeLogFileIndex) {
+        lastUploadedByteOffset = res.nextOffset;
+        syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+      }
+    }
+  }
+
+  // Queue the next unsent row when Core 0 is idle and Wi-Fi is connected
+  if (!uploadInFlight && wifiConnected && (currentTime - lastTransmission >= TRANSMIT_INTERVAL)) {
     lastTransmission = currentTime;
     transmitData();
   }
@@ -1059,9 +1121,12 @@ void updateDisplay(const ProcessedData &data) {
   renderDisplay(data);
 }
 
-// reads the next unsent row from the active CSV log file, converts it to JSON, and uploads it to Firebase
+// Core 1: reads the next unsent CSV row from LittleFS, formats JSON, and hands it off to Core 0
 void transmitData() {
-  if (faults.storage.status || !wifiConnected || lastUploadedByteOffset >= currentLogFileSize) return;
+  if (uploadInFlight || !firebaseUploadQueue || faults.storage.status ||
+      !wifiConnected || lastUploadedByteOffset >= currentLogFileSize) {
+    return;
+  }
 
   File logFile = LittleFS.open(getLogFilePath(), "r");
   if (!logFile) return;
@@ -1072,10 +1137,19 @@ void transmitData() {
   size_t nextOffset = logFile.position();
   logFile.close();
 
-  String jsonPayload;
-  if (line.isEmpty() || !csvLineToJson(line, jsonPayload) || sendJsonToFirebase(jsonPayload)) {
+  UploadJob job = {};
+  job.nextOffset = nextOffset;
+  job.fileIndex  = activeLogFileIndex;
+
+  // Skip empty/header/malformed lines directly on Core 1 without waking Core 0
+  if (line.isEmpty() || !csvLineToJson(line, job.json, sizeof(job.json))) {
     lastUploadedByteOffset = nextOffset;
     syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+    return;
+  }
+
+  if (xQueueSend(firebaseUploadQueue, &job, 0) == pdTRUE) {
+    uploadInFlight = true;
   }
 }
 
