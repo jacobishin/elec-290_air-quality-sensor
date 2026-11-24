@@ -10,6 +10,8 @@ extern const char* LOG_FILE_2_PATH;
 extern uint8_t activeLogFileIndex;
 extern size_t lastUploadedByteOffset;
 extern size_t currentLogFileSize;
+extern unsigned int totalLogEntries;
+extern unsigned int unsentLogEntries;
 extern bool wifiConnected;
 extern bool timeSyncedThisBoot;
 

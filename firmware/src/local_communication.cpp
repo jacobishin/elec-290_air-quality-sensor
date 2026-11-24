@@ -1,10 +1,12 @@
 #include "local_communication.h"
 #include "sensors.h"
+#include "storage.h"
 #include <Preferences.h>
 #include <math.h>
+#include <string.h>
 
 // ============================================================
-// EXTERNAL REFERENCES FROM MAIN.CPP & STORAGE.CPP
+// EXTERNAL REFERENCES FROM MAIN.CPP
 // ============================================================
 extern const int I2C_SDA_SCREEN_PIN; // SPI MOSI (GPIO 23)
 extern const int I2C_SCL_SCREEN_PIN; // SPI SCK  (GPIO 18)
@@ -22,16 +24,9 @@ extern const float ECO2_THRESHOLD1_PPM;
 extern const float C0_THRESHOLD2_PPM;
 extern const float ECO2_THRESHOLD2_PPM;
 
-extern bool wifiConnected;
 extern bool dangerAlertActive;
 extern String activeAlertMessage;
 extern FaultStatus faults;
-
-extern uint8_t activeLogFileIndex;
-extern size_t lastUploadedByteOffset;
-extern size_t currentLogFileSize;
-extern bool timeSyncedThisBoot;
-extern const char* getLogFilePath(bool active = true);
 
 // ============================================================
 // CONFIGURATION & CONSTANTS
@@ -47,10 +42,15 @@ static const int DIR_MAP[5] = { DIR_NONE, MAP_PHYS_LEFT, MAP_PHYS_RIGHT, MAP_PHY
 
 static const int SCR_W = 240;
 static const int SCR_H = 320;
-static const uint16_t COL_HEADER = 0x2104;
-static const uint16_t COL_GREY   = 0x4208;
-static const uint16_t COL_LIGHT  = 0x7BEF;
-static const uint16_t COL_DARKGR = 0x0320;
+
+// Theme 1: Medical / Lab Instrument (Teal & Crisp White on Pure Black)
+static const uint16_t COL_HEADER = 0x0147; // Deep teal-navy header bar
+static const uint16_t COL_BORDER = 0x2B4E; // Calm steel-teal normal borders
+static const uint16_t COL_LABEL  = 0x87FF; // Soft ice-cyan sensor names
+static const uint16_t COL_UNIT   = 0x6B6D; // Muted slate units & hints
+static const uint16_t COL_OK_BG  = 0x0264; // Deep teal-green OK pill
+static const uint16_t COL_OK_FG  = 0x57EA; // Soft mint-emerald OK text
+static const uint16_t COL_WARN   = 0xFD20; // Warm amber (warmup / T1 warning)
 
 static const float JOY_ENGAGE  = 0.50f;
 static const float JOY_RELEASE = 0.25f;
@@ -88,6 +88,8 @@ static bool lastWifiDrawn      = false;
 static int  lastFaultDrawn     = -1;
 static bool lastMutedDrawn     = false;
 static uint16_t lastCardBorder[6] = {0};
+static uint16_t lastCardCol[6]    = {0};
+static char lastCardText[6][12]   = {{0}};
 
 static unsigned long lastJoyPollMs  = 0;
 static unsigned long lastFlashMs    = 0;
@@ -159,7 +161,7 @@ void initDisplayAndJoystickHardware() {
   lcd.setRotation(2); // Portrait 240x320 (change to 0 if upside down)
   lcd.fillScreen(ST77XX_BLACK);
 
-  lcd.setTextColor(ST77XX_CYAN);
+  lcd.setTextColor(COL_LABEL);
   lcd.setTextSize(2);
   lcd.setCursor(32, 136);
   lcd.print("HARMFUL GAS");
@@ -331,8 +333,8 @@ static void drawHeaderBadges(int fCount) {
     printCentered(buf, 151, 11, 1, ST77XX_WHITE, ST77XX_RED);
   }
 
-  uint16_t pillBg = wifiConnected ? COL_DARKGR : ST77XX_RED;
-  uint16_t pillFg = wifiConnected ? ST77XX_GREEN : ST77XX_YELLOW;
+  uint16_t pillBg = wifiConnected ? COL_OK_BG : ST77XX_RED;
+  uint16_t pillFg = wifiConnected ? COL_OK_FG : ST77XX_YELLOW;
   lcd.fillRoundRect(178, 5, 56, 20, 4, pillBg);
   printCentered(wifiConnected ? "WiFi:OK" : "WiFi:DC", 206, 11, 1, pillFg, pillBg);
 }
@@ -356,7 +358,11 @@ static void drawDashboard(const ProcessedData &data, bool full) {
   if (full) {
     lcd.fillScreen(ST77XX_BLACK);
     drawHeader("AIR MON", true);
-    for (int i = 0; i < 6; i++) lastCardBorder[i] = 0;
+    for (int i = 0; i < 6; i++) {
+      lastCardBorder[i]  = 0;
+      lastCardCol[i]     = 0;
+      lastCardText[i][0] = '\0';
+    }
     lastMutedDrawn = !muted;
   } else if (fCount != lastFaultDrawn || wifiConnected != lastWifiDrawn) {
     drawHeaderBadges(fCount);
@@ -381,12 +387,12 @@ static void drawDashboard(const ProcessedData &data, bool full) {
     bool ok     = s[i]->valid && isfinite(s[i]->average);
     bool warmup = !ok && ((i == 0 && isCOInWarmup()) || ((i == 1 || i == 2) && isSGP30InWarmup()));
 
-    uint16_t border = ST77XX_GREEN;
+    uint16_t border = COL_BORDER;
     uint16_t valCol = ST77XX_WHITE;
-    if (warmup)                                      { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
-    else if (!ok)                                    { border = ST77XX_RED;    valCol = ST77XX_RED;    }
-    else if (t2[i] > 0.0f && s[i]->average >= t2[i]) { border = ST77XX_RED;    valCol = ST77XX_RED;    }
-    else if (t1[i] > 0.0f && s[i]->average >= t1[i]) { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
+    if (warmup)                                      { border = COL_WARN;   valCol = COL_WARN;   }
+    else if (!ok)                                    { border = ST77XX_RED; valCol = ST77XX_RED; }
+    else if (t2[i] > 0.0f && s[i]->average >= t2[i]) { border = ST77XX_RED; valCol = ST77XX_RED; }
+    else if (t1[i] > 0.0f && s[i]->average >= t1[i]) { border = COL_WARN;   valCol = COL_WARN;   }
 
     if (full || border != lastCardBorder[i]) {
       lastCardBorder[i] = border;
@@ -395,19 +401,16 @@ static void drawDashboard(const ProcessedData &data, bool full) {
 
     if (full) {
       lcd.setTextSize(2);
-      lcd.setTextColor(COL_LIGHT, ST77XX_BLACK);
+      lcd.setTextColor(COL_LABEL, ST77XX_BLACK);
       lcd.setCursor(x + 8, y + 8);
       lcd.print(names[i]);
 
       lcd.setTextSize(1);
-      lcd.setTextColor(COL_GREY, ST77XX_BLACK);
+      lcd.setTextColor(COL_UNIT, ST77XX_BLACK);
       lcd.setCursor(x + 8, y + 28);
       lcd.print(units[i]);
     }
 
-    lcd.setTextSize(2);
-    lcd.setTextColor(valCol, ST77XX_BLACK);
-    lcd.setCursor(x + 8, y + 50);
     if (ok) {
       if (useDec[i]) snprintf(buf, sizeof(buf), "%-7.1f", s[i]->average);
       else           snprintf(buf, sizeof(buf), "%-7.0f", s[i]->average);
@@ -416,7 +419,16 @@ static void drawDashboard(const ProcessedData &data, bool full) {
     } else {
       snprintf(buf, sizeof(buf), "%-7s", "FAULT");
     }
-    lcd.print(buf);
+
+    if (full || valCol != lastCardCol[i] || strcmp(buf, lastCardText[i]) != 0) {
+      lastCardCol[i] = valCol;
+      strncpy(lastCardText[i], buf, sizeof(lastCardText[i]) - 1);
+      lastCardText[i][sizeof(lastCardText[i]) - 1] = '\0';
+      lcd.setTextSize(2);
+      lcd.setTextColor(valCol, ST77XX_BLACK);
+      lcd.setCursor(x + 8, y + 50);
+      lcd.print(buf);
+    }
   }
 
   // Slim 1-line footer hint (pure black, no bulky colored banner)
@@ -426,7 +438,7 @@ static void drawDashboard(const ProcessedData &data, bool full) {
     if (muted) {
       printCentered("ALARM SILENCED (DANGER ACTIVE)", 120, 308, 1, ST77XX_RED, ST77XX_BLACK);
     } else {
-      printCentered("L/R: Faults   Click: Buzzer", 120, 308, 1, COL_LIGHT, ST77XX_BLACK);
+      printCentered("L/R: Faults   Click: Buzzer", 120, 308, 1, COL_UNIT, ST77XX_BLACK);
     }
   }
 }
@@ -481,19 +493,19 @@ static void drawSystemPage(bool full) {
     drawHeader("FAULTS & SYS", false);
 
     lcd.setTextSize(1);
-    lcd.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+    lcd.setTextColor(COL_LABEL, ST77XX_BLACK);
     lcd.setCursor(16, 44);
     lcd.print("ACTIVE FAULTS");
 
-    lcd.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
+    lcd.setTextColor(COL_LABEL, ST77XX_BLACK);
     lcd.setCursor(16, 208);
     lcd.print("STORAGE & SYNC");
 
-    printCentered("L/R: Dashboard   Click: Buzzer", 120, 304, 1, COL_LIGHT, ST77XX_BLACK);
+    printCentered("L/R: Dashboard   Click: Buzzer", 120, 304, 1, COL_UNIT, ST77XX_BLACK);
   }
 
-  lcd.drawRoundRect(8, 36, 224, 156, 6, fCount ? ST77XX_RED : COL_GREY);
-  lcd.drawRoundRect(8, 200, 224, 92, 6, faults.storage.status ? ST77XX_RED : COL_GREY);
+  lcd.drawRoundRect(8, 36, 224, 156, 6, fCount ? ST77XX_RED : COL_BORDER);
+  lcd.drawRoundRect(8, 200, 224, 92, 6, faults.storage.status ? ST77XX_RED : COL_BORDER);
 
   const char* fNames[5] = {"Sensor", "Inval ", "Stale ", "Store ", "Wi-Fi "};
   const bool  fStat[5]  = {faults.sensor.status, faults.readingInvalid.status,
@@ -505,7 +517,7 @@ static void drawSystemPage(bool full) {
   lcd.setTextSize(2);
   for (int i = 0; i < 5; i++) {
     lcd.setCursor(16, 60 + i * 25);
-    lcd.setTextColor(fStat[i] ? ST77XX_RED : ST77XX_GREEN, ST77XX_BLACK);
+    lcd.setTextColor(fStat[i] ? ST77XX_RED : COL_OK_FG, ST77XX_BLACK);
     snprintf(buf, sizeof(buf), "%s:%-3s %3d", fNames[i], fStat[i] ? "FLT" : "OK", fNum[i]);
     lcd.print(buf);
   }
@@ -516,14 +528,12 @@ static void drawSystemPage(bool full) {
   snprintf(buf, sizeof(buf), "File: %-18s (#%u)", getLogFilePath(true), activeLogFileIndex);
   lcd.print(buf);
 
-  unsigned int unsent = (currentLogFileSize > lastUploadedByteOffset)
-                        ? (unsigned int)(currentLogFileSize - lastUploadedByteOffset) : 0;
   lcd.setCursor(16, 246);
-  snprintf(buf, sizeof(buf), "Size: %-6uB  Unsent: %-6uB", (unsigned int)currentLogFileSize, unsent);
+  snprintf(buf, sizeof(buf), "Entries: %-5u Unsent: %-5u", totalLogEntries, unsentLogEntries);
   lcd.print(buf);
 
   lcd.setCursor(16, 266);
-  lcd.setTextColor(wifiConnected ? ST77XX_GREEN : ST77XX_YELLOW, ST77XX_BLACK);
+  lcd.setTextColor(wifiConnected ? COL_OK_FG : COL_WARN, ST77XX_BLACK);
   snprintf(buf, sizeof(buf), "WiFi: %-3s  |  NTP: %-10s",
            wifiConnected ? "OK" : "DC", timeSyncedThisBoot ? "SYNCED" : "BOOT SEC");
   lcd.print(buf);
@@ -538,7 +548,7 @@ static void drawSliderBar(int value, int maxVal, bool selected) {
   int fillW = (innerW * constrain(value, 0, maxVal)) / maxVal;
 
   lcd.drawRoundRect(barX, barY, barW, barH, 5, ST77XX_WHITE);
-  if (fillW > 0)      lcd.fillRect(innerX, innerY, fillW, innerH, selected ? ST77XX_CYAN : ST77XX_WHITE);
+  if (fillW > 0)      lcd.fillRect(innerX, innerY, fillW, innerH, selected ? COL_LABEL : ST77XX_WHITE);
   if (fillW < innerW) lcd.fillRect(innerX + fillW, innerY, innerW - fillW, innerH, ST77XX_BLACK);
 }
 
@@ -546,11 +556,11 @@ static void drawBuzzerPage(bool full) {
   if (full) {
     lcd.fillScreen(ST77XX_BLACK);
     drawHeader("BUZZER", false);
-    printCentered("U/D: Row  L/R: Vol  Click: OK", 120, 302, 1, COL_LIGHT, ST77XX_BLACK);
+    printCentered("U/D: Row  L/R: Vol  Click: OK", 120, 302, 1, COL_UNIT, ST77XX_BLACK);
   }
 
   bool s0 = (uiState.subRow == 0);
-  lcd.drawRoundRect(12, 48, 216, 86, 8, s0 ? ST77XX_CYAN : COL_GREY);
+  lcd.drawRoundRect(12, 48, 216, 86, 8, s0 ? COL_LABEL : COL_BORDER);
   drawSliderBar(buzzerVolume, 10, s0);
 
   char buf[16];
@@ -561,16 +571,16 @@ static void drawBuzzerPage(bool full) {
   bool s1 = (uiState.subRow == 1);
   bool hi = (testBtnUntilMs > 0);
   if (full || hi) {
-    lcd.fillRoundRect(14, 154, 212, 50, 6, hi ? ST77XX_CYAN : ST77XX_BLACK);
+    lcd.fillRoundRect(14, 154, 212, 50, 6, hi ? COL_LABEL : ST77XX_BLACK);
   }
-  lcd.drawRoundRect(12, 152, 216, 54, 8, s1 ? ST77XX_CYAN : COL_GREY);
+  lcd.drawRoundRect(12, 152, 216, 54, 8, s1 ? COL_LABEL : COL_BORDER);
   printCentered(hi ? (buzzerVolume ? "BEEPING..." : "  MUTED   ") : "TEST SOUND",
-                120, 171, 2, hi ? ST77XX_BLACK : (s1 ? ST77XX_CYAN : ST77XX_WHITE),
-                hi ? ST77XX_CYAN : ST77XX_BLACK);
+                120, 171, 2, hi ? ST77XX_BLACK : (s1 ? COL_LABEL : ST77XX_WHITE),
+                hi ? COL_LABEL : ST77XX_BLACK);
 
   bool s2 = (uiState.subRow == 2);
-  lcd.drawRoundRect(12, 222, 216, 54, 8, s2 ? ST77XX_CYAN : COL_GREY);
-  printCentered("SAVE & BACK", 120, 241, 2, s2 ? ST77XX_CYAN : ST77XX_WHITE, ST77XX_BLACK);
+  lcd.drawRoundRect(12, 222, 216, 54, 8, s2 ? COL_LABEL : COL_BORDER);
+  printCentered("SAVE & BACK", 120, 241, 2, s2 ? COL_LABEL : ST77XX_WHITE, ST77XX_BLACK);
 }
 
 // ============================================================
@@ -607,6 +617,13 @@ void renderDisplay(const ProcessedData &data) {
   needsFullRedraw = false;
 }
 
+static void switchScreen(DisplayScreen next, const ProcessedData &data) {
+  uiState.currentScreen = next;
+  if (next == BUZZER_PAGE) uiState.subRow = 0;
+  needsFullRedraw = true;
+  renderDisplay(data);
+}
+
 void handleJoystickInput(unsigned long now, const ProcessedData &data) {
   // 1. Immediate life-safety Alert override & 350 ms flashing (RTM R3)
   bool wantAlert = dangerAlertActive && !uiState.alertMutedByJoystick;
@@ -630,9 +647,7 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
   // 3. Auto-exit Buzzer page after 30 s inactivity
   if (uiState.currentScreen == BUZZER_PAGE && (now - lastInputMs > SETTINGS_TIMEOUT_MS)) {
     uiPrefs.putInt("vol", buzzerVolume);
-    uiState.currentScreen = PAGE_DASHBOARD;
-    needsFullRedraw       = true;
-    renderDisplay(data);
+    switchScreen(PAGE_DASHBOARD, data);
     return;
   }
 
@@ -654,27 +669,11 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
       }
       return;
     }
-    if (dir == DIR_LEFT || dir == DIR_RIGHT) {
-      uiState.currentScreen = SYSTEM_PAGE;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    } else if (click) {
-      uiState.currentScreen = BUZZER_PAGE;
-      uiState.subRow        = 0;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    }
+    if (dir == DIR_LEFT || dir == DIR_RIGHT) switchScreen(SYSTEM_PAGE, data);
+    else if (click)                          switchScreen(BUZZER_PAGE, data);
   } else if (uiState.currentScreen == SYSTEM_PAGE) {
-    if (dir == DIR_LEFT || dir == DIR_RIGHT) {
-      uiState.currentScreen = PAGE_DASHBOARD;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    } else if (click) {
-      uiState.currentScreen = BUZZER_PAGE;
-      uiState.subRow        = 0;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    }
+    if (dir == DIR_LEFT || dir == DIR_RIGHT) switchScreen(PAGE_DASHBOARD, data);
+    else if (click)                          switchScreen(BUZZER_PAGE, data);
   } else if (uiState.currentScreen == BUZZER_PAGE) {
     if (dir == DIR_UP || dir == DIR_DOWN) {
       uiState.subRow = (uiState.subRow + (dir == DIR_DOWN ? 1 : 2)) % 3;
@@ -688,9 +687,7 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
       }
     } else if (dir == DIR_LEFT && uiState.subRow != 0) {
       uiPrefs.putInt("vol", buzzerVolume);
-      uiState.currentScreen = PAGE_DASHBOARD;
-      needsFullRedraw       = true;
-      renderDisplay(data);
+      switchScreen(PAGE_DASHBOARD, data);
     } else if (click) {
       if (uiState.subRow == 0) {
         oneShotMs = 140;
@@ -700,9 +697,7 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
         drawBuzzerPage(false);
       } else {
         uiPrefs.putInt("vol", buzzerVolume);
-        uiState.currentScreen = PAGE_DASHBOARD;
-        needsFullRedraw       = true;
-        renderDisplay(data);
+        switchScreen(PAGE_DASHBOARD, data);
       }
     }
   }

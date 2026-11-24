@@ -4,7 +4,7 @@ ELEC 290 Section 002-01 - Harmful Gas Monitor Firmware
 Hardware (aligned with ELEC290 Pinout.pdf + MQ-7 Heater Circuit):
 ESP32-WROVER-E
 SGP30 (I2C)    - eCO2 and TVOC sensor (GPIO 21/22)
-MQ-7 (ADC1)    - CO sensor (AO -> GPIO 36; optional S8050 PWM -> GPIO 14; see sensors.h)
+MQ-7 (ADC1)    - CO sensor (AO -> GPIO 36; S8050 PWM -> GPIO 14
 DHT22          - Temp and humidity sensor (GPIO 13)
 PMS7003 (UART) - PM2.5 sensor (PMS RX -> GPIO 33, PMS TX -> GPIO 19)
 Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
@@ -75,7 +75,7 @@ extern const int BUZZER_PIN         = 25; // Passive Buzzer    -> GPIO 25 (LEDC 
 // System intervals (ms)
 const unsigned long ALERT_CHECK_INTERVAL     = 1000UL;   // 1s fast danger check (RTM R3 <= 2s response)
 const unsigned long DISPLAY_INTERVAL         = 5000UL;   // 5s LCD & Wi-Fi refresh window
-const unsigned long LOG_INTERVAL             = 30000UL; // 5-minute CSV log & Firebase window
+const unsigned long LOG_INTERVAL             = 300000UL; // 5-minute CSV log & Firebase window
 extern const unsigned long TRANSMIT_INTERVAL = 2000UL;   // 2s background Firebase upload check
 
 // Air quality thresholds (CO and eCO2 only; -1.0f = unconfigured placeholder)
@@ -221,10 +221,6 @@ static void evaluateAirQualityLive() {
   activeAlertMessage = msg;
 }
 
-void updateDisplay(const ProcessedData &data) {
-  renderDisplay(data);
-}
-
 
 // ============================================================
 // SETUP & MAIN LOOP
@@ -241,7 +237,7 @@ void setup() {
   initializeCommunication();
 
   checkWiFiConnection();
-  updateDisplay(displayData);
+  renderDisplay(displayData);
   Serial.println("Harmful Gas Monitor Started.\n");
 }
 
@@ -263,7 +259,7 @@ void loop() {
     finalizeWindow(safetyAccumulators, displayData);
     checkTransientFaultRecovery(displayData);
     checkWiFiConnection();
-    updateDisplay(displayData);
+    renderDisplay(displayData);
   }
 
   // --- Section 3 & 5: 5-minute Window Processing & LittleFS CSV Logging ---

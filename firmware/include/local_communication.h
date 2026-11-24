@@ -48,7 +48,7 @@ struct FaultStatus {
 // ============================================================
 
 enum DisplayScreen {
-  PAGE_DASHBOARD = 0, // Airy 2x2 gas grid + borderless Temp/Hum + minimal header/banner
+  PAGE_DASHBOARD = 0, // 2x3 card grid of all 6 sensors on pure black + header badges
   SYSTEM_PAGE,        // Top-level Faults & LittleFS/NTP sync (L/R from Dashboard)
   BUZZER_PAGE         // Volume 0..10 (NVS saved) + Test Sound (Click from Dashboard)
 };

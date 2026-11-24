@@ -1,31 +1,20 @@
 #include "tests.h"
 #include "local_communication.h"
+#include "storage.h"
 #include <WiFi.h>
 #include <LittleFS.h>
-#include <Preferences.h>
 #include <ctype.h>
 
 // ============================================================
 // EXTERNAL REFERENCES FROM MAIN.CPP
 // ============================================================
-extern const char* LOG_FILE_1_PATH;
-extern const char* LOG_FILE_2_PATH;
-extern uint8_t activeLogFileIndex;
-extern size_t lastUploadedByteOffset;
-extern size_t currentLogFileSize;
-extern bool wifiConnected;
-extern bool timeSyncedThisBoot;
 extern bool dangerAlertActive;
 extern String activeAlertMessage;
 extern ProcessedData displayData;
 extern ProcessedData loggedData;
 extern FaultStatus faults;
 
-extern const char* getLogFilePath(bool active = true);
-extern bool initNewLogFile(uint8_t fileIndex);
 extern int faultDetections(faultenum fault, bool override);
-extern void updateDisplay(const ProcessedData &data);
-extern void checkWiFiConnection();
 
 // ============================================================
 // MODULE TEST STATE
@@ -47,8 +36,10 @@ void dumpActiveLogFile() {
     Serial.println("ERROR: Could not open active log file.");
     return;
   }
+  uint8_t buf[128];
   while (f.available()) {
-    Serial.write(f.read());
+    size_t n = f.read(buf, sizeof(buf));
+    if (n > 0) Serial.write(buf, n);
   }
   f.close();
   Serial.println("--- END OF FILE ---\n");
@@ -66,20 +57,19 @@ void resetAllStorageLogs() {
 void printStorageSyncStatus() {
   Serial.println("\n--- STORAGE & SYNC STATUS ---");
   Serial.printf("Active File      : %s (Index %u)\n", getLogFilePath(true), activeLogFileIndex);
-  Serial.printf("File Size        : %u bytes\n", (unsigned int)currentLogFileSize);
-  Serial.printf("Uploaded Offset  : %u bytes (%u bytes unsent)\n",
-                (unsigned int)lastUploadedByteOffset,
-                (currentLogFileSize > lastUploadedByteOffset) ? (unsigned int)(currentLogFileSize - lastUploadedByteOffset) : 0);
+  Serial.printf("Entries          : %u total (%u unsent)\n", totalLogEntries, unsentLogEntries);
+  Serial.printf("File Size        : %u bytes (offset %u B)\n",
+                (unsigned int)currentLogFileSize, (unsigned int)lastUploadedByteOffset);
   Serial.printf("Wi-Fi / NTP Sync : Wi-Fi %s | NTP %s\n",
                 wifiConnected ? "CONNECTED" : "DISCONNECTED",
                 timeSyncedThisBoot ? "SYNCED" : "UNSYNCED");
   Serial.println("-----------------------------\n");
 }
 
-// Prints a summary of the 60-second sensor averages, alert status, and fault counts (RTM R7)
+// Prints a summary of the latest logged sensor averages, alert status, and fault counts (RTM R7)
 void printDebugInformation() {
   Serial.println();
-  Serial.printf("===== 60s WINDOW SUMMARY (Active File: %s) =====\n", getLogFilePath(true));
+  Serial.printf("===== LOG WINDOW SUMMARY (Active File: %s) =====\n", getLogFilePath(true));
   Serial.printf("Alert Status: %s | Time Synced: %s\n",
                 activeAlertMessage.c_str(), timeSyncedThisBoot ? "YES" : "NO");
   Serial.printf("CO Avg: %.2f ppm | TVOC Avg: %.2f ppb | eCO2 Avg: %.2f ppm\n",
@@ -106,7 +96,7 @@ static void testInjectValidData() {
   displayData.humidityPercent    = { 46.0f, 47.0f, 3, true };
   displayData.pm25UGM3           = { 9.2f, 10.0f, 5, true };
   loggedData = displayData;
-  updateDisplay(displayData);
+  renderDisplay(displayData);
   Serial.println("[TEST R1/T1.1] Injected valid mock sensor data to LCD & loggedData.");
 }
 
@@ -117,7 +107,7 @@ static void testInjectInvalidData() {
   loggedData.coPPM     = displayData.coPPM;
   loggedData.pm25UGM3  = displayData.pm25UGM3;
   faultDetections(INVALID, false);
-  updateDisplay(displayData);
+  renderDisplay(displayData);
   Serial.println("[TEST R8/T1.2] Injected invalid CO (NaN) & PM2.5 (-5.0) readings.");
 }
 
@@ -125,7 +115,7 @@ static void testInjectInvalidData() {
 static void testToggleDangerAlert() {
   dangerAlertActive  = !dangerAlertActive;
   activeAlertMessage = dangerAlertActive ? "HIGH CO (TEST)" : "Normal";
-  updateDisplay(displayData);
+  renderDisplay(displayData);
   Serial.printf("[TEST R3] Danger Alert %s at %lu ms.\n",
                 dangerAlertActive ? "ACTIVATED" : "CLEARED", millis());
 }
@@ -136,7 +126,7 @@ static void testToggleWiFiDrop() {
     simulatedWifiDropped = true;
     WiFi.disconnect();
     checkWiFiConnection();
-    updateDisplay(displayData);
+    renderDisplay(displayData);
     Serial.println("[TEST R6/T1.3] Forced Wi-Fi DISCONNECT (check WiFi:DC & offline buffering).");
   } else {
     simulatedWifiDropped = false;
@@ -159,11 +149,9 @@ void runTestCommands() {
   // Periodic 60-second uptime log for R4/R7 endurance testing (when toggled on with '5')
   if (uptimeLogEnabled && (millis() - lastUptimeLog >= 60000UL)) {
     lastUptimeLog = millis();
-    unsigned int unsent = (currentLogFileSize > lastUploadedByteOffset)
-                          ? (unsigned int)(currentLogFileSize - lastUploadedByteOffset) : 0;
-    Serial.printf("[TEST R4/R7] Uptime: %lu min | File: %u B | Unsent: %u B | WiFi: %s\n",
-                  lastUptimeLog / 60000UL, (unsigned int)currentLogFileSize,
-                  unsent, wifiConnected ? "OK" : "DC");
+    Serial.printf("[TEST R4/R7] Uptime: %lu min | Entries: %u | Unsent: %u | WiFi: %s\n",
+                  lastUptimeLog / 60000UL, totalLogEntries, unsentLogEntries,
+                  wifiConnected ? "OK" : "DC");
   }
 
   if (!Serial.available()) return;
@@ -183,7 +171,7 @@ void runTestCommands() {
       faultDetections(WIFI, true);
       dangerAlertActive  = false;
       activeAlertMessage = "Normal";
-      updateDisplay(displayData);
+      renderDisplay(displayData);
       Serial.println("[TEST R8] Cleared all faults and reset danger alert.");
       break;
     case '1': testInjectValidData();       break;

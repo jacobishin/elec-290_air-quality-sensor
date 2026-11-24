@@ -30,7 +30,7 @@ const char* LOG_FILE_2_PATH = "/sensor_log_2.csv";
 static const size_t MAX_LOG_FILE_SIZE = 65536; // 64 KB x 2 fits safely inside 192 KB min_spiffs.csv LittleFS
 
 static const char* CSV_HEADER =
-    "timestamp_ms,alert_active,"
+    "timestamp,alert_active,"
     "co_avg,co_count,co_valid,"
     "tvoc_avg,tvoc_count,tvoc_valid,"
     "eco2_avg,eco2_count,eco2_valid,"
@@ -40,7 +40,7 @@ static const char* CSV_HEADER =
 
 // FreeRTOS IPC payloads (Core 1 owns LittleFS/NVS, Core 0 owns HTTPS)
 struct UploadJob {
-  char json[512];
+  char json[320];
   size_t nextOffset;
   uint8_t fileIndex;
 };
@@ -58,6 +58,8 @@ static Preferences syncPrefs;
 uint8_t activeLogFileIndex    = 1;
 size_t lastUploadedByteOffset = 0;
 size_t currentLogFileSize     = 0;
+unsigned int totalLogEntries  = 0;
+unsigned int unsentLogEntries = 0;
 bool wifiConnected            = false;
 bool timeSyncedThisBoot       = false;
 static unsigned long bootEpochSec = 0;
@@ -74,6 +76,31 @@ const char* getLogFilePath(bool active) {
   return ((activeLogFileIndex == 1) == active) ? LOG_FILE_1_PATH : LOG_FILE_2_PATH;
 }
 
+static void recountLogEntries() {
+  totalLogEntries  = 0;
+  unsentLogEntries = 0;
+
+  File f = LittleFS.open(getLogFilePath(), "r");
+  if (!f) return;
+
+  uint8_t buf[128];
+  size_t pos = 0;
+  unsigned int lineIndex = 0;
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    for (size_t i = 0; i < n; i++, pos++) {
+      if (buf[i] == '\n') {
+        if (lineIndex >= 1) { // Skip line 0 (CSV header)
+          totalLogEntries++;
+          if (pos >= lastUploadedByteOffset) unsentLogEntries++;
+        }
+        lineIndex++;
+      }
+    }
+  }
+  f.close();
+}
+
 bool initNewLogFile(uint8_t fileIndex) {
   activeLogFileIndex = fileIndex;
   File f = LittleFS.open(getLogFilePath(), "w");
@@ -85,6 +112,9 @@ bool initNewLogFile(uint8_t fileIndex) {
   f.println(CSV_HEADER);
   currentLogFileSize = lastUploadedByteOffset = f.size();
   f.close();
+
+  totalLogEntries  = 0;
+  unsentLogEntries = 0;
 
   syncPrefs.putUChar("active_file", activeLogFileIndex);
   syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
@@ -123,6 +153,7 @@ void initializeStorage() {
         lastUploadedByteOffset = 0;
         syncPrefs.putUInt("upload_offset", 0);
       }
+      recountLogEntries();
     } else {
       faultDetections(STORAGE, false);
       return;
@@ -173,6 +204,9 @@ void storeData(const ProcessedData &data) {
   logFile.close();
   if (written < static_cast<size_t>(pos)) {
     faultDetections(STORAGE, false);
+  } else {
+    totalLogEntries++;
+    unsentLogEntries++;
   }
 }
 
@@ -180,7 +214,7 @@ void storeData(const ProcessedData &data) {
 // CSV to JSON to CLOUD
 // ============================================================
 static bool csvLineToJson(char* csvLine, char* jsonOut, size_t jsonOutSize) {
-  if (strncmp(csvLine, "timestamp_", 10) == 0) return false;
+  if (strncmp(csvLine, "timestamp", 9) == 0 || strncmp(csvLine, "seconds,", 8) == 0) return false;
 
   char* tok[20];
   int n = 0;
@@ -193,7 +227,7 @@ static bool csvLineToJson(char* csvLine, char* jsonOut, size_t jsonOutSize) {
   }
 
   static const char* keys[6] = {"co", "tvoc", "eco2", "temp", "hum", "pm25"};
-  int pos = snprintf(jsonOut, jsonOutSize, "{\"timestamp_ms\":%lu", ts);
+  int pos = snprintf(jsonOut, jsonOutSize, "{\"timestamp\":%lu", ts);
   if (pos < 0 || static_cast<size_t>(pos) >= jsonOutSize) return false;
 
   for (int i = 0; i < 6; i++) {
@@ -217,23 +251,22 @@ static bool sendJsonToFirebase(const char* jsonPayload) {
     return true;
   }
 
-  // Static client & HTTPClient on Core 0 enable TLS keep-alive session reuse
+  // Static client, HTTPClient & URL on Core 0 enable TLS keep-alive reuse
   static WiFiClientSecure client;
   static HTTPClient http;
+  static char fullUrl[256];
   static bool configured = false;
   if (!configured) {
     client.setInsecure();
     http.setReuse(true);
     http.setConnectTimeout(3000);
     http.setTimeout(5000);
+    if (strlen(FIREBASE_AUTH_TOKEN) > 0) {
+      snprintf(fullUrl, sizeof(fullUrl), "%s?auth=%s", FIREBASE_URL, FIREBASE_AUTH_TOKEN);
+    } else {
+      snprintf(fullUrl, sizeof(fullUrl), "%s", FIREBASE_URL);
+    }
     configured = true;
-  }
-
-  char fullUrl[256];
-  if (strlen(FIREBASE_AUTH_TOKEN) > 0) {
-    snprintf(fullUrl, sizeof(fullUrl), "%s?auth=%s", FIREBASE_URL, FIREBASE_AUTH_TOKEN);
-  } else {
-    snprintf(fullUrl, sizeof(fullUrl), "%s", FIREBASE_URL);
   }
 
   if (!http.begin(client, fullUrl)) return false;
@@ -284,6 +317,7 @@ static void transmitData() {
   if (len == 0 || !csvLineToJson(line, job.json, sizeof(job.json))) {
     lastUploadedByteOffset = nextOffset;
     syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+    recountLogEntries();
     return;
   }
 
@@ -343,6 +377,7 @@ void pollFirebaseSync(unsigned long currentTime) {
       if (res.success && res.fileIndex == activeLogFileIndex) {
         lastUploadedByteOffset = res.nextOffset;
         syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
+        if (unsentLogEntries > 0) unsentLogEntries--;
       }
     }
   }
