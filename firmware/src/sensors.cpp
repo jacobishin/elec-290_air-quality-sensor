@@ -153,17 +153,6 @@ static bool readMQ7() {
     return false;
   }
 
-#if MQ7_DEBUG_SERIAL
-  static unsigned long lastMq7Log = 0;
-  unsigned long nowLog = millis();
-  if (MQ7_USE_HEATER_CIRCUIT || (nowLog - lastMq7Log >= 5000UL)) {
-    lastMq7Log = nowLog;
-    Serial.printf("[MQ7 %s] rawADC=%.0f pinV=%.2fV aoV=%.2fV Rs=%.0fOhm R0=%.0fOhm -> CO=%.1f ppm\n",
-                  MQ7_USE_HEATER_CIRCUIT ? "CYCLE" : "DIRECT",
-                  rawADC, pinVoltage, actualAOVoltage, rs, MQ7_R0_OHMS, coPPM);
-  }
-#endif
-
   rawData.coPPM.value     = coPPM;
   rawData.coPPM.valid     = true;
   rawData.coPPM.timestamp = millis();
@@ -245,19 +234,13 @@ bool isSGP30InWarmup() {
 // ============================================================
 static bool readPM25() {
   static uint8_t frame[32];
-  static uint8_t idx              = 0;
-  static unsigned long rxBytes    = 0;
-  static unsigned long badCS      = 0;
-  static unsigned long badLen     = 0;
-  static unsigned long lastDiag   = 0;
-  static bool gotFirstFrame       = false;
+  static uint8_t idx = 0;
 
   bool gotValidFrame  = false;
   uint16_t latestPM25 = 0;
 
   while (Serial2.available() > 0) {
     uint8_t b = static_cast<uint8_t>(Serial2.read());
-    rxBytes++;
 
     if (idx == 0) {
       if (b == 0x42) frame[idx++] = b;
@@ -269,7 +252,7 @@ static bool readPM25() {
       frame[idx++] = b;
       if (idx == 4) {
         uint16_t frameLen = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
-        if (frameLen != 28) { badLen++; idx = 0; }
+        if (frameLen != 28) idx = 0;
       } else if (idx == 32) {
         uint16_t sum = 0;
         for (int i = 0; i < 30; i++) sum += frame[i];
@@ -277,8 +260,6 @@ static bool readPM25() {
         if (sum == expected) {
           latestPM25 = (static_cast<uint16_t>(frame[12]) << 8) | frame[13]; // Atmospheric PM2.5 (ug/m3)
           gotValidFrame = true;
-        } else {
-          badCS++;
         }
         idx = 0;
       }
@@ -294,11 +275,6 @@ static bool readPM25() {
         faultDetections(STALE, false);
       }
     }
-    if (!rawData.pm25UGM3.valid && (now - lastDiag >= 5000UL)) {
-      lastDiag = now;
-      Serial.printf("[PMS7003] No valid frame (GPIO%d RX <- PMS TX). rxBytes=%lu badLen=%lu badCS=%lu\n",
-                    PMS_RX_PIN, rxBytes, badLen, badCS);
-    }
     return false;
   }
 
@@ -307,11 +283,6 @@ static bool readPM25() {
     rawData.pm25UGM3.valid = false;
     faultDetections(INVALID, false);
     return false;
-  }
-
-  if (!gotFirstFrame) {
-    gotFirstFrame = true;
-    Serial.printf("[PMS7003] First valid frame received! PM2.5=%.1f ug/m3 (rxBytes=%lu)\n", pm25Val, rxBytes);
   }
 
   rawData.pm25UGM3.value     = pm25Val;

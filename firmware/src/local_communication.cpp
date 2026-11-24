@@ -11,7 +11,6 @@ extern const int I2C_SCL_SCREEN_PIN; // SPI SCK  (GPIO 18)
 extern const int SCREEN_CS_PIN;      // GPIO 5
 extern const int SCREEN_DC_PIN;      // GPIO 27
 extern const int SCREEN_RST_PIN;     // GPIO 26
-extern const int SCREEN_BL_PIN;      // ST7789 BLK PWM (GPIO 4, LEDC Ch 2)
 
 extern const int JOY_X_PIN;          // GPIO 34
 extern const int JOY_Y_PIN;          // GPIO 35
@@ -51,9 +50,7 @@ static const int SCR_H = 320;
 static const uint16_t COL_HEADER = 0x2104;
 static const uint16_t COL_GREY   = 0x4208;
 static const uint16_t COL_LIGHT  = 0x7BEF;
-static const uint16_t COL_AMBER  = 0xFD20;
 static const uint16_t COL_DARKGR = 0x0320;
-static const uint16_t COL_WARMBG = 0x02B5;
 
 static const float JOY_ENGAGE  = 0.50f;
 static const float JOY_RELEASE = 0.25f;
@@ -61,15 +58,9 @@ static const unsigned long JOY_POLL_MS         = 30;
 static const unsigned long FLASH_MS            = 350;
 static const unsigned long SETTINGS_TIMEOUT_MS = 30000UL;
 
-// LEDC PWM channels (Ch 0 = MQ-7 heater, Ch 2 = LCD backlight, Ch 4 = Buzzer)
 static const int BUZZ_FREQ = 2500;
-static const int BUZZER_CH = 4;
+static const int BUZZER_CH = 4; // Avoids LEDC ch 0 (MQ-7 heater)
 static const uint8_t VOL_DUTY[11] = {0, 12, 28, 44, 60, 76, 92, 106, 116, 124, 128};
-
-static const int BL_FREQ = 5000;
-static const int BL_CH   = 2;
-// Perceptually spaced 8-bit PWM curve for brightness 1..10 (never 0 so UI stays visible)
-static const uint8_t BL_DUTY[11] = {20, 20, 36, 56, 80, 108, 138, 170, 200, 228, 255};
 
 // ============================================================
 // MODULE STATE
@@ -79,8 +70,7 @@ static Preferences uiPrefs;
 UIState uiState = {};
 
 static int centerX = 2048, centerY = 2048;
-static int buzzerVolume  = 5;  // 0..10 (NVS "gas_ui" / "vol")
-static int lcdBrightness = 10; // 1..10 (NVS "gas_ui" / "bright")
+static int buzzerVolume = 5; // 0..10 (saved in NVS "gas_ui")
 
 // Non-blocking millis() buzzer state
 static bool buzzerActive      = false;
@@ -89,67 +79,46 @@ static int  oneShotMs         = 0;
 static int  testBeepsLeft     = 0;
 static bool testBeepOn        = false;
 
-// Display & dirty-tracking cache
+// Display & cache state
 static bool warningActive      = false;
-static bool anyGasValid        = false;
-static bool anySensorWarming   = false;
 static bool alertActiveView    = false;
 static bool flashPhase         = false;
 static bool needsFullRedraw    = true;
 static bool lastWifiDrawn      = false;
 static int  lastFaultDrawn     = -1;
-static int  lastAgeDrawn       = -1;
-static int  lastBannerKey      = -1;
-static uint16_t lastRowBorder[5] = {0}; // 4 gas rows + 1 climate strip
+static bool lastMutedDrawn     = false;
+static uint16_t lastCardBorder[6] = {0};
 
 static unsigned long lastJoyPollMs  = 0;
 static unsigned long lastFlashMs    = 0;
 static unsigned long lastInputMs    = 0;
-static unsigned long lastAgeTickMs  = 0;
 static unsigned long testBtnUntilMs = 0;
 
 // ============================================================
 // LEDC PWM HELPERS (ESP32 Arduino Core 2.x & 3.x compatible)
 // ============================================================
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  static void buzzerPwmBegin()   { ledcAttachChannel(BUZZER_PIN, BUZZ_FREQ, 8, BUZZER_CH); }
-  static void buzzerOn(int d)    { ledcWrite(BUZZER_PIN, d); }
-  static void buzzerOff()        { ledcWrite(BUZZER_PIN, 0); }
-  static void blPwmBegin()       { ledcAttachChannel(SCREEN_BL_PIN, BL_FREQ, 8, BL_CH); }
-  static void blPwmWrite(int d)  { ledcWrite(SCREEN_BL_PIN, d); }
+  static void pwmBegin()      { ledcAttachChannel(BUZZER_PIN, BUZZ_FREQ, 8, BUZZER_CH); }
+  static void buzzerOn(int d) { ledcWrite(BUZZER_PIN, d); }
+  static void buzzerOff()     { ledcWrite(BUZZER_PIN, 0); }
 #else
-  static void buzzerPwmBegin() {
+  static void pwmBegin() {
     ledcSetup(BUZZER_CH, BUZZ_FREQ, 8);
     ledcAttachPin(BUZZER_PIN, BUZZER_CH);
   }
-  static void buzzerOn(int d)    { ledcWrite(BUZZER_CH, d); }
-  static void buzzerOff()        { ledcWrite(BUZZER_CH, 0); }
-  static void blPwmBegin() {
-    ledcSetup(BL_CH, BL_FREQ, 8);
-    ledcAttachPin(SCREEN_BL_PIN, BL_CH);
-  }
-  static void blPwmWrite(int d)  { ledcWrite(BL_CH, d); }
+  static void buzzerOn(int d) { ledcWrite(BUZZER_CH, d); }
+  static void buzzerOff()     { ledcWrite(BUZZER_CH, 0); }
 #endif
 
 static int volumeDuty() { return VOL_DUTY[constrain(buzzerVolume, 0, 10)]; }
-
-static void applyBrightness() {
-  blPwmWrite(BL_DUTY[constrain(lcdBrightness, 1, 10)]);
-}
-
-static void saveUISettings() {
-  uiPrefs.putInt("vol", buzzerVolume);
-  uiPrefs.putInt("bright", lcdBrightness);
-}
 
 // ============================================================
 // INITIALIZATION
 // ============================================================
 void initBuzzerHardware() {
   uiPrefs.begin("gas_ui", false);
-  buzzerVolume  = constrain(uiPrefs.getInt("vol", 5), 0, 10);
-  lcdBrightness = constrain(uiPrefs.getInt("bright", 10), 1, 10);
-  buzzerPwmBegin();
+  buzzerVolume = constrain(uiPrefs.getInt("vol", 5), 0, 10);
+  pwmBegin();
   buzzerOff();
 }
 
@@ -176,7 +145,7 @@ static void calibrateJoystick() {
 }
 
 void initDisplayAndJoystickHardware() {
-  Serial.println("Initializing Portrait ST7789 (HW SPI), Backlight PWM & Joystick...");
+  Serial.println("Initializing Portrait ST7789 (HW SPI) & Joystick...");
   pinMode(JOY_X_PIN, INPUT);
   pinMode(JOY_Y_PIN, INPUT);
   pinMode(JOY_SW_PIN, INPUT_PULLUP);
@@ -184,9 +153,6 @@ void initDisplayAndJoystickHardware() {
   analogSetPinAttenuation(JOY_X_PIN, ADC_11db);
   analogSetPinAttenuation(JOY_Y_PIN, ADC_11db);
   calibrateJoystick();
-
-  blPwmBegin();
-  applyBrightness();
 
   SPI.begin(I2C_SCL_SCREEN_PIN, -1, I2C_SDA_SCREEN_PIN, SCREEN_CS_PIN);
   lcd.init(240, 320);
@@ -222,7 +188,7 @@ void refreshBuzzerState(unsigned long now) {
     return;
   }
 
-  // Priority 1: Life-safety Danger alarm (always overrides Settings & test beeps, RTM R3)
+  // Priority 1: Life-safety Danger alarm (always overrides all pages, RTM R3)
   if (dangerAlertActive && !uiState.alertMutedByJoystick) {
     testBeepsLeft = 0;
     oneShotMs     = 0;
@@ -326,16 +292,12 @@ static int readDirection(unsigned long now, bool allowRepeat) {
 // VISUAL STATE & DRAWING HELPERS
 // ============================================================
 static void updateVisualGasState(const ProcessedData &data) {
-  const AverageData* s[4] = {&data.coPPM, &data.eco2PPM, &data.tvocPPB, &data.pm25UGM3};
-  const float t1[4]       = {C0_THRESHOLD1_PPM, ECO2_THRESHOLD1_PPM, 0.0f, 0.0f};
+  const AverageData* s[2] = {&data.coPPM, &data.eco2PPM};
+  const float t1[2]       = {C0_THRESHOLD1_PPM, ECO2_THRESHOLD1_PPM};
 
-  anyGasValid      = false;
-  warningActive    = false;
-  anySensorWarming = isCOInWarmup() || isSGP30InWarmup();
-
-  for (int i = 0; i < 4; i++) {
+  warningActive = false;
+  for (int i = 0; i < 2; i++) {
     if (!s[i]->valid || !isfinite(s[i]->average)) continue;
-    anyGasValid = true;
     if (t1[i] > 0.0f && s[i]->average >= t1[i]) warningActive = true;
   }
 }
@@ -352,191 +314,120 @@ static void printCentered(const char* s, int cx, int y, uint8_t size, uint16_t f
   lcd.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
   if (opaque) lcd.setTextColor(fg, bg);
   else        lcd.setTextColor(fg);
-  lcd.setCursor(cx - w / 2, y);
+  lcd.setCursor(cx - (int)w / 2, y);
   lcd.print(s);
 }
 
-static void drawFaultBadge(int fCount) {
-  lastFaultDrawn  = fCount;
-  uint16_t pillBg = fCount ? ST77XX_RED : COL_DARKGR;
-  uint16_t pillFg = fCount ? ST77XX_WHITE : ST77XX_GREEN;
-  char buf[8];
-  if (fCount) snprintf(buf, sizeof(buf), "FLT:%d", fCount);
-  else        snprintf(buf, sizeof(buf), "OK");
-  lcd.fillRoundRect(98, 4, 54, 20, 4, pillBg);
-  printCentered(buf, 125, 10, 1, pillFg, pillBg);
-}
+static void drawHeaderBadges(int fCount) {
+  lastFaultDrawn = fCount;
+  lastWifiDrawn  = wifiConnected;
 
-static void drawWifiBadge() {
-  lastWifiDrawn   = wifiConnected;
+  // Show red FLT:N badge only when a fault is active
+  lcd.fillRect(128, 4, 46, 22, COL_HEADER);
+  if (fCount > 0) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "FLT:%d", fCount);
+    lcd.fillRoundRect(130, 5, 42, 20, 4, ST77XX_RED);
+    printCentered(buf, 151, 11, 1, ST77XX_WHITE, ST77XX_RED);
+  }
+
   uint16_t pillBg = wifiConnected ? COL_DARKGR : ST77XX_RED;
   uint16_t pillFg = wifiConnected ? ST77XX_GREEN : ST77XX_YELLOW;
-  lcd.fillRoundRect(156, 4, 44, 20, 4, pillBg);
-  printCentered(wifiConnected ? "WiFi" : "NoWF", 178, 10, 1, pillFg, pillBg);
+  lcd.fillRoundRect(178, 5, 56, 20, 4, pillBg);
+  printCentered(wifiConnected ? "WiFi:OK" : "WiFi:DC", 206, 11, 1, pillFg, pillBg);
 }
 
-static void drawAgeBadge(const ProcessedData &data) {
-  int ageSec = (data.windowEndTimestamp > 0 && millis() >= data.windowEndTimestamp)
-               ? (int)((millis() - data.windowEndTimestamp) / 1000UL)
-               : -1;
-  if (ageSec > 99) ageSec = 99;
-  if (ageSec == lastAgeDrawn) return;
-  lastAgeDrawn = ageSec;
-
-  char buf[6];
-  if (ageSec < 0) snprintf(buf, sizeof(buf), " -- ");
-  else            snprintf(buf, sizeof(buf), "%2ds ", ageSec);
-
-  lcd.setTextSize(1);
-  lcd.setTextColor(COL_LIGHT, COL_HEADER);
-  lcd.setCursor(206, 10);
-  lcd.print(buf);
-}
-
-static void drawHeader(const char* title, bool showBadges, const ProcessedData* data = nullptr) {
-  lcd.fillRect(0, 0, SCR_W, 28, COL_HEADER);
+static void drawHeader(const char* title, bool showBadges) {
+  lcd.fillRect(0, 0, SCR_W, 30, COL_HEADER);
   lcd.setTextSize(2);
   lcd.setTextColor(ST77XX_WHITE, COL_HEADER);
-  lcd.setCursor(6, 6);
+  lcd.setCursor(8, 7);
   lcd.print(title);
-  if (showBadges) {
-    drawFaultBadge(activeFaultCount());
-    drawWifiBadge();
-    lastAgeDrawn = -2;
-    if (data) drawAgeBadge(*data);
-  }
-}
-
-// Flicker-free slider bar helper (draws filled + unfilled halves directly)
-static void drawSliderBar(int value, int maxVal, bool selected) {
-  const int barX = 24, barY = 62, barW = 192, barH = 22;
-  const int innerX = barX + 2, innerY = barY + 2, innerW = barW - 4, innerH = barH - 4;
-  int fillW = (innerW * constrain(value, 0, maxVal)) / maxVal;
-
-  lcd.drawRoundRect(barX, barY, barW, barH, 5, ST77XX_WHITE);
-  if (fillW > 0) {
-    lcd.fillRect(innerX, innerY, fillW, innerH, selected ? ST77XX_CYAN : ST77XX_WHITE);
-  }
-  if (fillW < innerW) {
-    lcd.fillRect(innerX + fillW, innerY, innerW - fillW, innerH, ST77XX_BLACK);
-  }
+  if (showBadges) drawHeaderBadges(activeFaultCount());
 }
 
 // ============================================================
-// SCREEN 1: PLAN A DASHBOARD (4 Full-Width Gas Rows + Climate Strip)
+// SCREEN 1: CLASSIC 2x3 CARD GRID (Expanded, Pure Black, No Banner)
 // ============================================================
 static void drawDashboard(const ProcessedData &data, bool full) {
   int fCount = activeFaultCount();
+  bool muted = dangerAlertActive && uiState.alertMutedByJoystick;
 
   if (full) {
     lcd.fillScreen(ST77XX_BLACK);
-    drawHeader("GAS MON", true, &data);
-    lastBannerKey = -1;
-    for (int i = 0; i < 5; i++) lastRowBorder[i] = 0;
-  } else {
-    if (fCount != lastFaultDrawn)        drawFaultBadge(fCount);
-    if (wifiConnected != lastWifiDrawn)  drawWifiBadge();
-    drawAgeBadge(data);
+    drawHeader("AIR MON", true);
+    for (int i = 0; i < 6; i++) lastCardBorder[i] = 0;
+    lastMutedDrawn = !muted;
+  } else if (fCount != lastFaultDrawn || wifiConnected != lastWifiDrawn) {
+    drawHeaderBadges(fCount);
   }
 
-  // 4 Primary Gas Rows (CO, eCO2, TVOC, PM2.5)
-  const AverageData* s[4] = {&data.coPPM, &data.eco2PPM, &data.tvocPPB, &data.pm25UGM3};
-  const char* names[4]    = {"CO", "eCO2", "TVOC", "PM2.5"};
-  const char* units[4]    = {"ppm", "ppm", "ppb", "ug/m3"};
-  const bool  useDec[4]   = {true, false, false, false};
-  const float t1[4]       = {C0_THRESHOLD1_PPM, ECO2_THRESHOLD1_PPM, 0.0f, 0.0f};
-  const float t2[4]       = {C0_THRESHOLD2_PPM, ECO2_THRESHOLD2_PPM, 0.0f, 0.0f};
+  const AverageData* s[6] = {
+    &data.coPPM, &data.tvocPPB, &data.eco2PPM,
+    &data.temperatureC, &data.humidityPercent, &data.pm25UGM3
+  };
+  const char* names[6]  = {"CO", "TVOC", "eCO2", "Temp", "Hum", "PM2.5"};
+  const char* units[6]  = {"ppm", "ppb", "ppm", "C", "%", "ug/m3"};
+  const bool  useDec[6] = {true, false, false, true, false, false};
+  const float t1[6]     = {C0_THRESHOLD1_PPM, 0.0f, ECO2_THRESHOLD1_PPM, 0.0f, 0.0f, 0.0f};
+  const float t2[6]     = {C0_THRESHOLD2_PPM, 0.0f, ECO2_THRESHOLD2_PPM, 0.0f, 0.0f, 0.0f};
 
+  // 2x3 cards: 112 x 84 px each (uses space freed by removing the bottom banner)
   char buf[16];
-  for (int i = 0; i < 4; i++) {
-    int y = 32 + i * 50;
+  for (int i = 0; i < 6; i++) {
+    int x = 6 + (i % 2) * 116;
+    int y = 36 + (i / 2) * 90;
+
     bool ok     = s[i]->valid && isfinite(s[i]->average);
     bool warmup = !ok && ((i == 0 && isCOInWarmup()) || ((i == 1 || i == 2) && isSGP30InWarmup()));
 
     uint16_t border = ST77XX_GREEN;
     uint16_t valCol = ST77XX_WHITE;
-    if (warmup)                                       { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
-    else if (!ok)                                     { border = ST77XX_RED;    valCol = ST77XX_RED;    }
-    else if (t2[i] > 0.0f && s[i]->average >= t2[i])  { border = ST77XX_RED;    valCol = ST77XX_RED;    }
-    else if (t1[i] > 0.0f && s[i]->average >= t1[i])  { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
+    if (warmup)                                      { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
+    else if (!ok)                                    { border = ST77XX_RED;    valCol = ST77XX_RED;    }
+    else if (t2[i] > 0.0f && s[i]->average >= t2[i]) { border = ST77XX_RED;    valCol = ST77XX_RED;    }
+    else if (t1[i] > 0.0f && s[i]->average >= t1[i]) { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
 
-    if (full || border != lastRowBorder[i]) {
-      lastRowBorder[i] = border;
-      lcd.drawRoundRect(6, y, 228, 46, 6, border);
+    if (full || border != lastCardBorder[i]) {
+      lastCardBorder[i] = border;
+      lcd.drawRoundRect(x, y, 112, 84, 6, border);
     }
 
     if (full) {
       lcd.setTextSize(2);
-      lcd.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-      lcd.setCursor(14, y + 7);
+      lcd.setTextColor(COL_LIGHT, ST77XX_BLACK);
+      lcd.setCursor(x + 8, y + 8);
       lcd.print(names[i]);
 
       lcd.setTextSize(1);
-      lcd.setTextColor(COL_LIGHT, ST77XX_BLACK);
-      lcd.setCursor(14, y + 28);
+      lcd.setTextColor(COL_GREY, ST77XX_BLACK);
+      lcd.setCursor(x + 8, y + 28);
       lcd.print(units[i]);
     }
 
-    lcd.setTextSize(3);
+    lcd.setTextSize(2);
     lcd.setTextColor(valCol, ST77XX_BLACK);
-    lcd.setCursor(92, y + 11);
+    lcd.setCursor(x + 8, y + 50);
     if (ok) {
-      if (useDec[i]) snprintf(buf, sizeof(buf), "%7.1f", s[i]->average);
-      else           snprintf(buf, sizeof(buf), "%7.0f", s[i]->average);
+      if (useDec[i]) snprintf(buf, sizeof(buf), "%-7.1f", s[i]->average);
+      else           snprintf(buf, sizeof(buf), "%-7.0f", s[i]->average);
     } else if (warmup) {
-      snprintf(buf, sizeof(buf), " WARMUP");
+      snprintf(buf, sizeof(buf), "%-7s", "WARMUP");
     } else {
-      snprintf(buf, sizeof(buf), "  FAULT");
+      snprintf(buf, sizeof(buf), "%-7s", "FAULT");
     }
     lcd.print(buf);
   }
 
-  // Compact Climate Strip (Temp & Humidity, size 2)
-  bool tempOk = data.temperatureC.valid && isfinite(data.temperatureC.average);
-  bool humOk  = data.humidityPercent.valid && isfinite(data.humidityPercent.average);
-  uint16_t climBorder = (tempOk && humOk) ? COL_GREY : ST77XX_RED;
-
-  if (full || climBorder != lastRowBorder[4]) {
-    lastRowBorder[4] = climBorder;
-    lcd.drawRoundRect(6, 234, 228, 34, 6, climBorder);
-    lcd.drawFastVLine(120, 240, 22, COL_GREY);
-  }
-
-  lcd.setTextSize(2);
-  lcd.setTextColor(tempOk ? ST77XX_CYAN : ST77XX_RED, ST77XX_BLACK);
-  lcd.setCursor(14, 243);
-  if (tempOk) snprintf(buf, sizeof(buf), "T:%4.1fC", data.temperatureC.average);
-  else        snprintf(buf, sizeof(buf), "T: ERR ");
-  lcd.print(buf);
-
-  lcd.setTextColor(humOk ? ST77XX_CYAN : ST77XX_RED, ST77XX_BLACK);
-  lcd.setCursor(130, 243);
-  if (humOk) snprintf(buf, sizeof(buf), "H:%3.0f%% ", data.humidityPercent.average);
-  else       snprintf(buf, sizeof(buf), "H: ERR ");
-  lcd.print(buf);
-
-  // Cached Bottom Status Banner
-  int bKey = dangerAlertActive ? (uiState.alertMutedByJoystick ? 4 : 3)
-           : (!anyGasValid ? (anySensorWarming ? 6 : 5)
-                           : (warningActive ? 2 : (fCount > 0 ? 1 : 0)));
-
-  if (full || bKey != lastBannerKey) {
-    lastBannerKey = bKey;
-    uint16_t banBg = (bKey >= 3 && bKey <= 4) ? ST77XX_RED
-                   : (bKey == 2) ? ST77XX_YELLOW
-                   : (bKey == 6) ? COL_WARMBG
-                   : (bKey == 1 || bKey == 5) ? COL_AMBER : COL_DARKGR;
-    uint16_t banFg = (bKey == 2) ? ST77XX_BLACK : ST77XX_WHITE;
-    const char* txt = (bKey == 4) ? "ALARM SILENCED"
-                    : (bKey == 3) ? "DANGER!"
-                    : (bKey == 6) ? "WARMING UP"
-                    : (bKey == 5) ? "NO GAS DATA"
-                    : (bKey == 2) ? "WARNING"
-                    : (bKey == 1) ? "SYSTEM FAULT" : "AIR NORMAL";
-
-    lcd.fillRect(0, 274, SCR_W, 46, banBg);
-    printCentered(txt, 120, 281, 2, banFg, banBg);
-    printCentered("L/R:Faults  Click:Menu", 120, 304, 1, banFg, banBg);
+  // Slim 1-line footer hint (pure black, no bulky colored banner)
+  if (full || muted != lastMutedDrawn) {
+    lastMutedDrawn = muted;
+    lcd.fillRect(0, 306, SCR_W, 14, ST77XX_BLACK);
+    if (muted) {
+      printCentered("ALARM SILENCED (DANGER ACTIVE)", 120, 308, 1, ST77XX_RED, ST77XX_BLACK);
+    } else {
+      printCentered("L/R: Faults   Click: Buzzer", 120, 308, 1, COL_LIGHT, ST77XX_BLACK);
+    }
   }
 }
 
@@ -556,7 +447,6 @@ static void drawAlertScreen(bool phase, const ProcessedData &data) {
   snprintf(buf, sizeof(buf), "%.20s", activeAlertMessage.c_str());
   printCentered(buf, 120, 138, 2, fg, bg);
 
-  // Prefer live rawData so 1s spikes show immediately; fall back to 5s displayData
   float coVal = (rawData.coPPM.valid && isfinite(rawData.coPPM.value))
                 ? rawData.coPPM.value : (data.coPPM.valid ? data.coPPM.average : NAN);
   float ecVal = (rawData.eco2PPM.valid && isfinite(rawData.eco2PPM.value))
@@ -581,7 +471,7 @@ static void drawAlertScreen(bool phase, const ProcessedData &data) {
 }
 
 // ============================================================
-// SCREEN 2: TOP-LEVEL FAULTS & SYSTEM STATUS (Large Size 2 Faults)
+// SCREEN 2: TOP-LEVEL FAULTS & SYSTEM STATUS (Pure Black, Size 2 Faults)
 // ============================================================
 static void drawSystemPage(bool full) {
   int fCount = activeFaultCount();
@@ -590,22 +480,20 @@ static void drawSystemPage(bool full) {
     lcd.fillScreen(ST77XX_BLACK);
     drawHeader("FAULTS & SYS", false);
 
-    lcd.drawRoundRect(6, 34, 228, 158, 6, fCount ? ST77XX_RED : COL_GREY);
     lcd.setTextSize(1);
     lcd.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
-    lcd.setCursor(14, 41);
+    lcd.setCursor(16, 44);
     lcd.print("ACTIVE FAULTS");
 
-    lcd.drawRoundRect(6, 198, 228, 92, 6, faults.storage.status ? ST77XX_RED : COL_GREY);
     lcd.setTextColor(ST77XX_CYAN, ST77XX_BLACK);
-    lcd.setCursor(14, 206);
+    lcd.setCursor(16, 208);
     lcd.print("STORAGE & SYNC");
 
-    printCentered("L/R:Dashboard  Click:Menu", 120, 302, 1, COL_LIGHT, ST77XX_BLACK);
-  } else {
-    lcd.drawRoundRect(6, 34, 228, 158, 6, fCount ? ST77XX_RED : COL_GREY);
-    lcd.drawRoundRect(6, 198, 228, 92, 6, faults.storage.status ? ST77XX_RED : COL_GREY);
+    printCentered("L/R: Dashboard   Click: Buzzer", 120, 304, 1, COL_LIGHT, ST77XX_BLACK);
   }
+
+  lcd.drawRoundRect(8, 36, 224, 156, 6, fCount ? ST77XX_RED : COL_GREY);
+  lcd.drawRoundRect(8, 200, 224, 92, 6, faults.storage.status ? ST77XX_RED : COL_GREY);
 
   const char* fNames[5] = {"Sensor", "Inval ", "Stale ", "Store ", "Wi-Fi "};
   const bool  fStat[5]  = {faults.sensor.status, faults.readingInvalid.status,
@@ -616,7 +504,7 @@ static void drawSystemPage(bool full) {
   char buf[42];
   lcd.setTextSize(2);
   for (int i = 0; i < 5; i++) {
-    lcd.setCursor(14, 56 + i * 26);
+    lcd.setCursor(16, 60 + i * 25);
     lcd.setTextColor(fStat[i] ? ST77XX_RED : ST77XX_GREEN, ST77XX_BLACK);
     snprintf(buf, sizeof(buf), "%s:%-3s %3d", fNames[i], fStat[i] ? "FLT" : "OK", fNum[i]);
     lcd.print(buf);
@@ -624,17 +512,17 @@ static void drawSystemPage(bool full) {
 
   lcd.setTextSize(1);
   lcd.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  lcd.setCursor(14, 224);
+  lcd.setCursor(16, 226);
   snprintf(buf, sizeof(buf), "File: %-18s (#%u)", getLogFilePath(true), activeLogFileIndex);
   lcd.print(buf);
 
   unsigned int unsent = (currentLogFileSize > lastUploadedByteOffset)
                         ? (unsigned int)(currentLogFileSize - lastUploadedByteOffset) : 0;
-  lcd.setCursor(14, 244);
+  lcd.setCursor(16, 246);
   snprintf(buf, sizeof(buf), "Size: %-6uB  Unsent: %-6uB", (unsigned int)currentLogFileSize, unsent);
   lcd.print(buf);
 
-  lcd.setCursor(14, 264);
+  lcd.setCursor(16, 266);
   lcd.setTextColor(wifiConnected ? ST77XX_GREEN : ST77XX_YELLOW, ST77XX_BLACK);
   snprintf(buf, sizeof(buf), "WiFi: %-3s  |  NTP: %-10s",
            wifiConnected ? "OK" : "DC", timeSyncedThisBoot ? "SYNCED" : "BOOT SEC");
@@ -642,44 +530,18 @@ static void drawSystemPage(bool full) {
 }
 
 // ============================================================
-// SCREEN 3: SETTINGS MENU (Flicker-Free Partial Redraw)
+// SCREEN 3: BUZZER VOLUME PAGE (Pure Black, Flicker-Free)
 // ============================================================
-static void drawSettingsMenu(bool full) {
-  if (full) {
-    lcd.fillScreen(ST77XX_BLACK);
-    drawHeader("SETTINGS", false);
-    printCentered("U/D: Select  Click: Open", 120, 298, 1, COL_LIGHT, ST77XX_BLACK);
-  }
+static void drawSliderBar(int value, int maxVal, bool selected) {
+  const int barX = 24, barY = 62, barW = 192, barH = 22;
+  const int innerX = barX + 2, innerY = barY + 2, innerW = barW - 4, innerH = barH - 4;
+  int fillW = (innerW * constrain(value, 0, maxVal)) / maxVal;
 
-  const char* titles[3] = {"Buzzer Volume", "Brightness", "BACK"};
-  char sub[22];
-
-  for (int i = 0; i < 3; i++) {
-    int y           = 46 + i * 78;
-    bool sel        = (uiState.menuIndex == i);
-    uint16_t border = sel ? ST77XX_CYAN : COL_GREY;
-
-    // Draw borders only (no fillRoundRect) to eliminate flicker
-    lcd.drawRoundRect(12, y, 216, 66, 8, border);
-    lcd.drawRoundRect(13, y + 1, 214, 64, 7, sel ? border : ST77XX_BLACK);
-
-    printCentered(titles[i], 120, y + (i == 2 ? 25 : 14), 2,
-                  sel ? ST77XX_CYAN : ST77XX_WHITE, ST77XX_BLACK);
-
-    if (i == 0) {
-      if (buzzerVolume == 0) snprintf(sub, sizeof(sub), "    MUTED    ");
-      else                   snprintf(sub, sizeof(sub), "Volume: %2d/10", buzzerVolume);
-      printCentered(sub, 120, y + 40, 1, COL_LIGHT, ST77XX_BLACK);
-    } else if (i == 1) {
-      snprintf(sub, sizeof(sub), "Level: %3d%%  ", lcdBrightness * 10);
-      printCentered(sub, 120, y + 40, 1, COL_LIGHT, ST77XX_BLACK);
-    }
-  }
+  lcd.drawRoundRect(barX, barY, barW, barH, 5, ST77XX_WHITE);
+  if (fillW > 0)      lcd.fillRect(innerX, innerY, fillW, innerH, selected ? ST77XX_CYAN : ST77XX_WHITE);
+  if (fillW < innerW) lcd.fillRect(innerX + fillW, innerY, innerW - fillW, innerH, ST77XX_BLACK);
 }
 
-// ============================================================
-// SCREEN 4: BUZZER PAGE (Flicker-Free)
-// ============================================================
 static void drawBuzzerPage(bool full) {
   if (full) {
     lcd.fillScreen(ST77XX_BLACK);
@@ -712,29 +574,6 @@ static void drawBuzzerPage(bool full) {
 }
 
 // ============================================================
-// SCREEN 5: BRIGHTNESS PAGE (Flicker-Free PWM Control)
-// ============================================================
-static void drawBrightnessPage(bool full) {
-  if (full) {
-    lcd.fillScreen(ST77XX_BLACK);
-    drawHeader("BRIGHTNESS", false);
-    printCentered("L/R: Adjust  Click: Save", 120, 302, 1, COL_LIGHT, ST77XX_BLACK);
-  }
-
-  bool s0 = (uiState.subRow == 0);
-  lcd.drawRoundRect(12, 48, 216, 104, 8, s0 ? ST77XX_CYAN : COL_GREY);
-  drawSliderBar(lcdBrightness, 10, s0);
-
-  char buf[16];
-  snprintf(buf, sizeof(buf), " %3d%% ", lcdBrightness * 10);
-  printCentered(buf, 120, 100, 3, ST77XX_WHITE, ST77XX_BLACK);
-
-  bool s1 = (uiState.subRow == 1);
-  lcd.drawRoundRect(12, 176, 216, 54, 8, s1 ? ST77XX_CYAN : COL_GREY);
-  printCentered("SAVE & BACK", 120, 195, 2, s1 ? ST77XX_CYAN : ST77XX_WHITE, ST77XX_BLACK);
-}
-
-// ============================================================
 // PUBLIC DISPLAY & INPUT HANDLERS
 // ============================================================
 void renderDisplay(const ProcessedData &data) {
@@ -743,7 +582,7 @@ void renderDisplay(const ProcessedData &data) {
   // Life-safety override: immediately exit any page on Danger (RTM R3)
   if (dangerAlertActive && !uiState.alertMutedByJoystick) {
     if (uiState.currentScreen != PAGE_DASHBOARD) {
-      saveUISettings();
+      uiPrefs.putInt("vol", buzzerVolume);
       uiState.currentScreen = PAGE_DASHBOARD;
     }
     if (!alertActiveView) {
@@ -761,11 +600,9 @@ void renderDisplay(const ProcessedData &data) {
   }
 
   switch (uiState.currentScreen) {
-    case PAGE_DASHBOARD:  drawDashboard(data, needsFullRedraw);     break;
-    case SYSTEM_PAGE:     drawSystemPage(needsFullRedraw);          break;
-    case SETTINGS_MENU:   drawSettingsMenu(needsFullRedraw);        break;
-    case BUZZER_PAGE:     drawBuzzerPage(needsFullRedraw);          break;
-    case BRIGHTNESS_PAGE: drawBrightnessPage(needsFullRedraw);      break;
+    case PAGE_DASHBOARD: drawDashboard(data, needsFullRedraw); break;
+    case SYSTEM_PAGE:    drawSystemPage(needsFullRedraw);      break;
+    case BUZZER_PAGE:    drawBuzzerPage(needsFullRedraw);      break;
   }
   needsFullRedraw = false;
 }
@@ -781,13 +618,7 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
     drawAlertScreen(flashPhase, data);
   }
 
-  // 2. Refresh 1s dashboard age indicator without redrawing full screen
-  if (!alertActiveView && uiState.currentScreen == PAGE_DASHBOARD && (now - lastAgeTickMs >= 1000UL)) {
-    lastAgeTickMs = now;
-    drawAgeBadge(data);
-  }
-
-  // 3. Reset TEST SOUND button highlight when done
+  // 2. Reset TEST SOUND button highlight when done
   if (testBtnUntilMs > 0 && now >= testBtnUntilMs) {
     testBtnUntilMs = 0;
     if (uiState.currentScreen == BUZZER_PAGE) {
@@ -796,30 +627,25 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
     }
   }
 
-  // 4. Auto-exit Settings screens after 30 s inactivity (top-level Dashboard & System stay open)
-  bool inSettings = (uiState.currentScreen == SETTINGS_MENU ||
-                     uiState.currentScreen == BUZZER_PAGE ||
-                     uiState.currentScreen == BRIGHTNESS_PAGE);
-  if (inSettings && (now - lastInputMs > SETTINGS_TIMEOUT_MS)) {
-    saveUISettings();
+  // 3. Auto-exit Buzzer page after 30 s inactivity
+  if (uiState.currentScreen == BUZZER_PAGE && (now - lastInputMs > SETTINGS_TIMEOUT_MS)) {
+    uiPrefs.putInt("vol", buzzerVolume);
     uiState.currentScreen = PAGE_DASHBOARD;
     needsFullRedraw       = true;
     renderDisplay(data);
     return;
   }
 
-  // 5. Throttle ADC/button polling to 30 ms (~33 Hz)
+  // 4. Throttle ADC/button polling to 30 ms (~33 Hz)
   if (now - lastJoyPollMs < JOY_POLL_MS) return;
   lastJoyPollMs = now;
 
-  bool allowRepeat = (uiState.subRow == 0) &&
-                     (uiState.currentScreen == BUZZER_PAGE || uiState.currentScreen == BRIGHTNESS_PAGE);
+  bool allowRepeat = (uiState.currentScreen == BUZZER_PAGE && uiState.subRow == 0);
   bool click = readButtonClick(now);
   int  dir   = readDirection(now, allowRepeat);
   if (!click && dir == DIR_NONE) return;
   lastInputMs = now;
 
-  // --- Screen-specific navigation ---
   if (uiState.currentScreen == PAGE_DASHBOARD) {
     if (alertActiveView) {
       if (click) {
@@ -833,8 +659,8 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
       needsFullRedraw       = true;
       renderDisplay(data);
     } else if (click) {
-      uiState.currentScreen = SETTINGS_MENU;
-      uiState.menuIndex     = 0;
+      uiState.currentScreen = BUZZER_PAGE;
+      uiState.subRow        = 0;
       needsFullRedraw       = true;
       renderDisplay(data);
     }
@@ -844,22 +670,7 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
       needsFullRedraw       = true;
       renderDisplay(data);
     } else if (click) {
-      uiState.currentScreen = SETTINGS_MENU;
-      uiState.menuIndex     = 0;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    }
-  } else if (uiState.currentScreen == SETTINGS_MENU) {
-    if (dir == DIR_UP || dir == DIR_DOWN) {
-      uiState.menuIndex = (uiState.menuIndex + (dir == DIR_DOWN ? 1 : 2)) % 3;
-      drawSettingsMenu(false);
-    } else if (dir == DIR_LEFT) {
-      uiState.currentScreen = PAGE_DASHBOARD;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    } else if (click) {
-      uiState.currentScreen = (uiState.menuIndex == 0) ? BUZZER_PAGE
-                            : (uiState.menuIndex == 1) ? BRIGHTNESS_PAGE : PAGE_DASHBOARD;
+      uiState.currentScreen = BUZZER_PAGE;
       uiState.subRow        = 0;
       needsFullRedraw       = true;
       renderDisplay(data);
@@ -876,8 +687,8 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
         drawBuzzerPage(false);
       }
     } else if (dir == DIR_LEFT && uiState.subRow != 0) {
-      saveUISettings();
-      uiState.currentScreen = SETTINGS_MENU;
+      uiPrefs.putInt("vol", buzzerVolume);
+      uiState.currentScreen = PAGE_DASHBOARD;
       needsFullRedraw       = true;
       renderDisplay(data);
     } else if (click) {
@@ -888,33 +699,11 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
         testBtnUntilMs = now + 1000;
         drawBuzzerPage(false);
       } else {
-        saveUISettings();
-        uiState.currentScreen = SETTINGS_MENU;
+        uiPrefs.putInt("vol", buzzerVolume);
+        uiState.currentScreen = PAGE_DASHBOARD;
         needsFullRedraw       = true;
         renderDisplay(data);
       }
-    }
-  } else if (uiState.currentScreen == BRIGHTNESS_PAGE) {
-    if (dir == DIR_UP || dir == DIR_DOWN) {
-      uiState.subRow = (uiState.subRow + 1) % 2;
-      drawBrightnessPage(false);
-    } else if ((dir == DIR_LEFT || dir == DIR_RIGHT) && uiState.subRow == 0) {
-      int old = lcdBrightness;
-      lcdBrightness = constrain(lcdBrightness + (dir == DIR_RIGHT ? 1 : -1), 1, 10);
-      if (lcdBrightness != old) {
-        applyBrightness();
-        drawBrightnessPage(false);
-      }
-    } else if (dir == DIR_LEFT && uiState.subRow != 0) {
-      saveUISettings();
-      uiState.currentScreen = SETTINGS_MENU;
-      needsFullRedraw       = true;
-      renderDisplay(data);
-    } else if (click) {
-      saveUISettings();
-      uiState.currentScreen = SETTINGS_MENU;
-      needsFullRedraw       = true;
-      renderDisplay(data);
     }
   }
 }

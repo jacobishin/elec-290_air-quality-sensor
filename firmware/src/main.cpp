@@ -24,7 +24,24 @@ Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
 // CONFIGURATION
 // ============================================================
 
-// 1 = enable Serial Monitor verification test suite, 0 = disable for final release
+/*
+ * BUILT-IN SERIAL MONITOR COMMANDS (115200 baud, single-char, case-insensitive)
+ * Set ENABLE_VERIFICATION_TESTS to 1 below, open Serial Monitor, and send:
+ *   Storage & Diagnostics:
+ *     d - Dump the entire active LittleFS CSV log file
+ *     r - Reset/wipe both CSV log files and NVS upload bookmark back to File 1
+ *     s - Print storage file size, unsent bytes, Wi-Fi, and NTP sync status
+ *     p - Print the latest logged window averages, alert status, and fault counts
+ *     f - Inject a simulated Storage fault
+ *     c - Clear all active fault flags/counters and reset any active danger alert
+ *   Verification & Simulation Tests (RTM R1, R3, R4, R6, R7, R8):
+ *     1 - Inject valid mock readings for all 6 sensors to LCD & loggedData
+ *     2 - Inject invalid readings (NaN CO, negative PM2.5) + INVALID fault
+ *     3 - Toggle simulated emergency Danger Alert (flashing screen + buzzer)
+ *     4 - Toggle forced Wi-Fi disconnect / reconnect (offline buffering test)
+ *     5 - Toggle 60-second uptime/storage heartbeat log for endurance testing
+ * Set ENABLE_VERIFICATION_TESTS to 0 when done
+ */
 #define ENABLE_VERIFICATION_TESTS 1
 
 // Wi-Fi & Firebase Realtime Database credentials
@@ -42,7 +59,6 @@ extern const int I2C_SCL_SCREEN_PIN = 18; // ST7789 SCK  (SCL) -> GPIO 18
 extern const int SCREEN_CS_PIN      = 5;  // ST7789 CS         -> GPIO 5
 extern const int SCREEN_DC_PIN      = 27; // ST7789 DC         -> GPIO 27
 extern const int SCREEN_RST_PIN     = 26; // ST7789 RST        -> GPIO 26
-extern const int SCREEN_BL_PIN      = 4;  // ST7789 BLK (PWM)  -> GPIO 4 (LEDC Ch 2)
 
 extern const int JOY_X_PIN          = 34; // Joystick VRx      -> GPIO 34
 extern const int JOY_Y_PIN          = 35; // Joystick VRy      -> GPIO 35
@@ -59,7 +75,7 @@ extern const int BUZZER_PIN         = 25; // Passive Buzzer    -> GPIO 25 (LEDC 
 // System intervals (ms)
 const unsigned long ALERT_CHECK_INTERVAL     = 1000UL;   // 1s fast danger check (RTM R3 <= 2s response)
 const unsigned long DISPLAY_INTERVAL         = 5000UL;   // 5s LCD & Wi-Fi refresh window
-const unsigned long LOG_INTERVAL             = 300000UL; // 5-minute CSV log & Firebase window
+const unsigned long LOG_INTERVAL             = 30000UL; // 5-minute CSV log & Firebase window
 extern const unsigned long TRANSMIT_INTERVAL = 2000UL;   // 2s background Firebase upload check
 
 // Air quality thresholds (CO and eCO2 only; -1.0f = unconfigured placeholder)

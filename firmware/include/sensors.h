@@ -14,9 +14,6 @@
 // 1 = Analog Heater-Cycle mode (S8050 PWM on GPIO 14 + 10k/20k divider on GPIO 36, 150s cycle)
 #define MQ7_USE_HEATER_CIRCUIT 0
 
-// 1 = print MQ-7 ADC / voltage / Rs / ppm to Serial for R0 calibration, 0 = quiet
-#define MQ7_DEBUG_SERIAL 1
-
 // ============================================================
 // DATA STRUCTURES
 // ============================================================
