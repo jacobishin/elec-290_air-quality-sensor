@@ -48,16 +48,17 @@ struct FaultStatus {
 // ============================================================
 
 enum DisplayScreen {
-  PAGE_DASHBOARD = 0, // 2x3 grid of all 6 sensors + Wi-Fi header + status banner
-  SETTINGS_MENU,      // System & Faults, Buzzer Volume, Back
-  SYSTEM_PAGE,        // LittleFS/NTP sync (R5) & 5 fault counters (R8)
-  BUZZER_PAGE         // Volume 0..10 (NVS saved) + Test Sound
+  PAGE_DASHBOARD = 0, // 4 full-width gas rows + Temp/Hum strip + header/banner
+  SYSTEM_PAGE,        // Top-level Faults (size 2) & LittleFS/NTP sync (L/R from Dashboard)
+  SETTINGS_MENU,      // Buzzer Volume, Brightness, Back
+  BUZZER_PAGE,        // Volume 0..10 (NVS saved) + Test Sound
+  BRIGHTNESS_PAGE     // Backlight PWM 1..10 (NVS saved, GPIO 4)
 };
 
 struct UIState {
   DisplayScreen currentScreen = PAGE_DASHBOARD;
-  int menuIndex               = 0;     // 0=System, 1=Buzzer, 2=Back
-  int buzzRow                 = 0;     // 0=Volume, 1=Test, 2=Back
+  int menuIndex               = 0;     // 0=Buzzer, 1=Brightness, 2=Back
+  int subRow                  = 0;     // Active row inside Buzzer / Brightness page
   bool alertMutedByJoystick   = false; // Silences buzzer until danger clears
 };
 

@@ -16,7 +16,7 @@ Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
 
 #include "local_communication.h" // Display, Joystick, and Buzzer module
 #include "sensors.h"             // MQ-7 (direct/heater-cycle), SGP30, PMS7003, DHT22
-#include "storage_sync.h"        // LittleFS ping-pong CSV & Core 0 Firebase sync
+#include "storage.h"        // LittleFS ping-pong CSV & Core 0 Firebase sync
 #include "tests.h"               // Serial verification test suite
 
 
@@ -42,6 +42,7 @@ extern const int I2C_SCL_SCREEN_PIN = 18; // ST7789 SCK  (SCL) -> GPIO 18
 extern const int SCREEN_CS_PIN      = 5;  // ST7789 CS         -> GPIO 5
 extern const int SCREEN_DC_PIN      = 27; // ST7789 DC         -> GPIO 27
 extern const int SCREEN_RST_PIN     = 26; // ST7789 RST        -> GPIO 26
+extern const int SCREEN_BL_PIN      = 4;  // ST7789 BLK (PWM)  -> GPIO 4 (LEDC Ch 2)
 
 extern const int JOY_X_PIN          = 34; // Joystick VRx      -> GPIO 34
 extern const int JOY_Y_PIN          = 35; // Joystick VRy      -> GPIO 35
