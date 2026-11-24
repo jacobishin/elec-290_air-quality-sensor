@@ -75,7 +75,7 @@ extern const int BUZZER_PIN         = 25; // Passive Buzzer    -> GPIO 25 (LEDC 
 // System intervals (ms)
 const unsigned long ALERT_CHECK_INTERVAL     = 1000UL;   // 1s fast danger check (RTM R3 <= 2s response)
 const unsigned long DISPLAY_INTERVAL         = 5000UL;   // 5s LCD & Wi-Fi refresh window
-const unsigned long LOG_INTERVAL             = 300000UL; // 5-minute CSV log & Firebase window
+const unsigned long LOG_INTERVAL             = 30000UL; // 5-minute CSV log & Firebase window
 extern const unsigned long TRANSMIT_INTERVAL = 2000UL;   // 2s background Firebase upload check
 
 // Air quality thresholds (CO and eCO2 only; -1.0f = unconfigured placeholder)

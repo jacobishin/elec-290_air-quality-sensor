@@ -57,6 +57,9 @@ static const float JOY_RELEASE = 0.25f;
 static const unsigned long JOY_POLL_MS         = 30;
 static const unsigned long FLASH_MS            = 350;
 static const unsigned long SETTINGS_TIMEOUT_MS = 30000UL;
+static const unsigned long BOOT_REFRESH_MS     = 250UL;
+static const unsigned long BOOT_MIN_MS         = 3000UL;
+static const unsigned long BOOT_MAX_MS         = 26000UL; // Covers 20s SGP30 warm-up + first 5s display window
 
 static const int BUZZ_FREQ = 2500;
 static const int BUZZER_CH = 4; // Avoids LEDC ch 0 (MQ-7 heater)
@@ -94,7 +97,14 @@ static char lastCardText[6][12]   = {{0}};
 static unsigned long lastJoyPollMs  = 0;
 static unsigned long lastFlashMs    = 0;
 static unsigned long lastInputMs    = 0;
+static unsigned long lastBootTickMs = 0;
 static unsigned long testBtnUntilMs = 0;
+
+// Boot checklist dirty cache (zero-flicker 4 Hz updates)
+static char     lastBootStat[5][8] = {{0}};
+static uint16_t lastBootCol[5]     = {0};
+static int      lastBootBarPx      = -1;
+static int      lastBootMsgKey     = -1;
 
 // ============================================================
 // LEDC PWM HELPERS (ESP32 Arduino Core 2.x & 3.x compatible)
@@ -160,14 +170,6 @@ void initDisplayAndJoystickHardware() {
   lcd.init(240, 320);
   lcd.setRotation(2); // Portrait 240x320 (change to 0 if upside down)
   lcd.fillScreen(ST77XX_BLACK);
-
-  lcd.setTextColor(COL_LABEL);
-  lcd.setTextSize(2);
-  lcd.setCursor(32, 136);
-  lcd.print("HARMFUL GAS");
-  lcd.setTextColor(ST77XX_WHITE);
-  lcd.setCursor(62, 162);
-  lcd.print("MONITOR");
 
   lastInputMs     = millis();
   needsFullRedraw = true;
@@ -346,6 +348,143 @@ static void drawHeader(const char* title, bool showBadges) {
   lcd.setCursor(8, 7);
   lcd.print(title);
   if (showBadges) drawHeaderBadges(activeFaultCount());
+}
+
+// ============================================================
+// SCREEN 0: NON-BLOCKING LIVE SELF-TEST BOOT SCREEN
+// ============================================================
+static bool allBootSensorsReady(const ProcessedData &data) {
+  bool coReady  = (data.coPPM.valid && isfinite(data.coPPM.average)) || isCOInWarmup();
+  bool sgpReady = data.eco2PPM.valid && isfinite(data.eco2PPM.average) &&
+                  data.tvocPPB.valid && isfinite(data.tvocPPB.average);
+  bool pmReady  = data.pm25UGM3.valid && isfinite(data.pm25UGM3.average);
+  bool thReady  = data.temperatureC.valid && isfinite(data.temperatureC.average) &&
+                  data.humidityPercent.valid && isfinite(data.humidityPercent.average);
+  return coReady && sgpReady && pmReady && thReady;
+}
+
+static void drawBootPage(bool full, const ProcessedData &data) {
+  unsigned long now = millis();
+
+  if (full) {
+    lcd.fillScreen(ST77XX_BLACK);
+
+    // Brand header band
+    lcd.fillRect(0, 0, SCR_W, 62, COL_HEADER);
+    lcd.fillRect(0, 62, SCR_W, 2, COL_LABEL);
+    printCentered("HARMFUL GAS", 120, 10, 2, ST77XX_WHITE, COL_HEADER);
+    printCentered("MONITOR",     120, 30, 2, COL_LABEL,    COL_HEADER);
+    printCentered("ELEC 290  -  TEAM 01", 120, 50, 1, COL_UNIT, COL_HEADER);
+
+    // Checklist frame & static sensor names
+    lcd.drawRoundRect(10, 74, 220, 154, 6, COL_BORDER);
+    lcd.setTextSize(1);
+    lcd.setTextColor(COL_LABEL, ST77XX_BLACK);
+    lcd.setCursor(18, 82);
+    lcd.print("SYSTEM SELF-TEST");
+
+    static const char* labels[5] = {"MQ-7 CO   ", "SGP30 Gas ", "PMS7003   ", "DHT22 T/H ", "Wi-Fi     "};
+    lcd.setTextSize(2);
+    lcd.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    for (int i = 0; i < 5; i++) {
+      lcd.setCursor(18, 100 + i * 24);
+      lcd.print(labels[i]);
+      lastBootStat[i][0] = '\0';
+      lastBootCol[i]     = 0;
+    }
+
+    // Progress bar outline & footer
+    lcd.drawRoundRect(16, 262, 208, 18, 4, COL_BORDER);
+    printCentered("Click joystick to skip", 120, 298, 1, COL_UNIT, ST77XX_BLACK);
+
+    lastBootBarPx  = -1;
+    lastBootMsgKey = -1;
+  }
+
+  // Compute live status badge for each subsystem
+  char     stat[5][8];
+  uint16_t col[5];
+
+  // 0: MQ-7 (CO)
+  if (rawData.coPPM.valid) {
+    snprintf(stat[0], sizeof(stat[0]), "[ OK ]"); col[0] = COL_OK_FG;
+  } else if (isCOInWarmup()) {
+    snprintf(stat[0], sizeof(stat[0]), "[WARM]"); col[0] = COL_WARN;
+  } else {
+    snprintf(stat[0], sizeof(stat[0]), "[WAIT]"); col[0] = COL_WARN;
+  }
+
+  // 1: SGP30 (eCO2 / TVOC)
+  if (rawData.eco2PPM.valid && rawData.tvocPPB.valid) {
+    snprintf(stat[1], sizeof(stat[1]), "[ OK ]"); col[1] = COL_OK_FG;
+  } else if (faults.sensor.status) {
+    snprintf(stat[1], sizeof(stat[1]), "[FAIL]"); col[1] = ST77XX_RED;
+  } else if (isSGP30InWarmup()) {
+    int rem = 20 - (int)(now / 1000UL);
+    if (rem < 1) rem = 1;
+    snprintf(stat[1], sizeof(stat[1]), "[%2ds ]", rem); col[1] = COL_WARN;
+  } else {
+    snprintf(stat[1], sizeof(stat[1]), "[WAIT]"); col[1] = COL_WARN;
+  }
+
+  // 2: PMS7003 (PM2.5)
+  if (rawData.pm25UGM3.valid) {
+    snprintf(stat[2], sizeof(stat[2]), "[ OK ]"); col[2] = COL_OK_FG;
+  } else {
+    snprintf(stat[2], sizeof(stat[2]), "[WAIT]"); col[2] = COL_WARN;
+  }
+
+  // 3: DHT22 (Temp / Hum)
+  if (rawData.temperatureC.valid && rawData.humidityPercent.valid) {
+    snprintf(stat[3], sizeof(stat[3]), "[ OK ]"); col[3] = COL_OK_FG;
+  } else {
+    snprintf(stat[3], sizeof(stat[3]), "[WAIT]"); col[3] = COL_WARN;
+  }
+
+  // 4: Wi-Fi
+  if (wifiConnected) {
+    snprintf(stat[4], sizeof(stat[4]), "[ OK ]"); col[4] = COL_OK_FG;
+  } else {
+    snprintf(stat[4], sizeof(stat[4]), "[WAIT]"); col[4] = COL_WARN;
+  }
+
+  // Redraw only changed status tokens (zero flicker)
+  lcd.setTextSize(2);
+  for (int i = 0; i < 5; i++) {
+    if (full || col[i] != lastBootCol[i] || strcmp(stat[i], lastBootStat[i]) != 0) {
+      lastBootCol[i] = col[i];
+      strncpy(lastBootStat[i], stat[i], sizeof(lastBootStat[i]) - 1);
+      lastBootStat[i][sizeof(lastBootStat[i]) - 1] = '\0';
+      lcd.setTextColor(col[i], ST77XX_BLACK);
+      lcd.setCursor(138, 100 + i * 24);
+      lcd.print(stat[i]);
+    }
+  }
+
+  // Status caption above progress bar
+  bool rawAllOk = (rawData.coPPM.valid || isCOInWarmup()) &&
+                  rawData.eco2PPM.valid && rawData.tvocPPB.valid &&
+                  rawData.pm25UGM3.valid &&
+                  rawData.temperatureC.valid && rawData.humidityPercent.valid;
+  int msgKey = allBootSensorsReady(data) ? 2 : (rawAllOk ? 1 : 0);
+  if (full || msgKey != lastBootMsgKey) {
+    lastBootMsgKey = msgKey;
+    const char* msg = (msgKey == 2) ? "   All sensors ready!   "
+                    : (msgKey == 1) ? " Finalizing readings... "
+                                    : " Warming up sensors...  ";
+    printCentered(msg, 120, 244, 1, (msgKey == 2) ? COL_OK_FG : COL_LABEL, ST77XX_BLACK);
+  }
+
+  // Smooth flicker-free progress bar (inner 204 x 14 px)
+  const int barMax = 204;
+  int fillPx = allBootSensorsReady(data)
+               ? barMax
+               : (int)min((unsigned long)barMax, (now * (unsigned long)barMax) / BOOT_MAX_MS);
+  if (fillPx != lastBootBarPx) {
+    if (fillPx > 0)      lcd.fillRect(18, 264, fillPx, 14, COL_LABEL);
+    if (fillPx < barMax) lcd.fillRect(18 + fillPx, 264, barMax - fillPx, 14, ST77XX_BLACK);
+    lastBootBarPx = fillPx;
+  }
 }
 
 // ============================================================
@@ -610,6 +749,7 @@ void renderDisplay(const ProcessedData &data) {
   }
 
   switch (uiState.currentScreen) {
+    case BOOT_PAGE:      drawBootPage(needsFullRedraw, data);  break;
     case PAGE_DASHBOARD: drawDashboard(data, needsFullRedraw); break;
     case SYSTEM_PAGE:    drawSystemPage(needsFullRedraw);      break;
     case BUZZER_PAGE:    drawBuzzerPage(needsFullRedraw);      break;
@@ -635,7 +775,19 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
     drawAlertScreen(flashPhase, data);
   }
 
-  // 2. Reset TEST SOUND button highlight when done
+  // 2. Non-blocking live boot screen refresh & smart auto-exit
+  if (!alertActiveView && uiState.currentScreen == BOOT_PAGE) {
+    if ((allBootSensorsReady(data) && now >= BOOT_MIN_MS) || (now >= BOOT_MAX_MS)) {
+      switchScreen(PAGE_DASHBOARD, data);
+      return;
+    }
+    if (now - lastBootTickMs >= BOOT_REFRESH_MS) {
+      lastBootTickMs = now;
+      drawBootPage(false, data);
+    }
+  }
+
+  // 3. Reset TEST SOUND button highlight when done
   if (testBtnUntilMs > 0 && now >= testBtnUntilMs) {
     testBtnUntilMs = 0;
     if (uiState.currentScreen == BUZZER_PAGE) {
@@ -644,14 +796,14 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
     }
   }
 
-  // 3. Auto-exit Buzzer page after 30 s inactivity
+  // 4. Auto-exit Buzzer page after 30 s inactivity
   if (uiState.currentScreen == BUZZER_PAGE && (now - lastInputMs > SETTINGS_TIMEOUT_MS)) {
     uiPrefs.putInt("vol", buzzerVolume);
     switchScreen(PAGE_DASHBOARD, data);
     return;
   }
 
-  // 4. Throttle ADC/button polling to 30 ms (~33 Hz)
+  // 5. Throttle ADC/button polling to 30 ms (~33 Hz)
   if (now - lastJoyPollMs < JOY_POLL_MS) return;
   lastJoyPollMs = now;
 
@@ -661,7 +813,11 @@ void handleJoystickInput(unsigned long now, const ProcessedData &data) {
   if (!click && dir == DIR_NONE) return;
   lastInputMs = now;
 
-  if (uiState.currentScreen == PAGE_DASHBOARD) {
+  if (uiState.currentScreen == BOOT_PAGE) {
+    if (click && now >= 500UL) {
+      switchScreen(PAGE_DASHBOARD, data);
+    }
+  } else if (uiState.currentScreen == PAGE_DASHBOARD) {
     if (alertActiveView) {
       if (click) {
         uiState.alertMutedByJoystick = true;

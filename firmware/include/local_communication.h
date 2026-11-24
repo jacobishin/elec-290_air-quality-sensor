@@ -48,13 +48,14 @@ struct FaultStatus {
 // ============================================================
 
 enum DisplayScreen {
-  PAGE_DASHBOARD = 0, // 2x3 card grid of all 6 sensors on pure black + header badges
+  BOOT_PAGE = 0,      // Non-blocking live sensor self-test & warm-up boot screen
+  PAGE_DASHBOARD,     // 2x3 card grid of all 6 sensors on pure black + header badges
   SYSTEM_PAGE,        // Top-level Faults & LittleFS/NTP sync (L/R from Dashboard)
   BUZZER_PAGE         // Volume 0..10 (NVS saved) + Test Sound (Click from Dashboard)
 };
 
 struct UIState {
-  DisplayScreen currentScreen = PAGE_DASHBOARD;
+  DisplayScreen currentScreen = BOOT_PAGE;
   int subRow                  = 0;     // Active row inside Buzzer page (0=Vol, 1=Test, 2=Back)
   bool alertMutedByJoystick   = false; // Silences buzzer until danger clears
 };
