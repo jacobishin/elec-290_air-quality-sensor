@@ -17,14 +17,17 @@ extern const int JOY_SW_PIN;         // GPIO 32
 extern const int BUZZER_PIN;         // GPIO 25
 
 extern const float C0_THRESHOLD1_PPM;
-extern const float TVOC_THRESHOLD1_PPB;
+// extern const float TVOC_THRESHOLD1_PPB;
 extern const float ECO2_THRESHOLD1_PPM;
-extern const float PM25_THRESHOLD1_UGM3;
+// extern const float PM25_THRESHOLD1_UGM3;
 
 extern const float C0_THRESHOLD2_PPM;
-extern const float TVOC_THRESHOLD2_PPB;
+// extern const float TVOC_THRESHOLD2_PPB;
 extern const float ECO2_THRESHOLD2_PPM;
-extern const float PM25_THRESHOLD2_UGM3;
+// extern const float PM25_THRESHOLD2_UGM3;
+
+extern bool isCOInWarmup();
+extern bool isSGP30InWarmup();
 
 extern bool wifiConnected;
 extern bool dangerAlertActive;
@@ -296,7 +299,7 @@ static int readDirection(unsigned long now, bool allowRepeat) {
 // ============================================================
 static void updateVisualGasState(const ProcessedData &data) {
   const AverageData* s[4] = {&data.coPPM, &data.tvocPPB, &data.eco2PPM, &data.pm25UGM3};
-  const float t1[4] = {C0_THRESHOLD1_PPM, TVOC_THRESHOLD1_PPB, ECO2_THRESHOLD1_PPM, PM25_THRESHOLD1_UGM3};
+  const float t1[4] = {C0_THRESHOLD1_PPM, 0.0f, ECO2_THRESHOLD1_PPM, 0.0f};
 
   anyGasValid = false;
   warningActive = false;
@@ -359,18 +362,20 @@ static void drawDashboard(const ProcessedData &data, bool full) {
   };
   const char* names[6] = {"CO", "TVOC", "eCO2", "Temp", "Hum", "PM2.5"};
   const char* units[6] = {"ppm", "ppb", "ppm", "C", "%", "ug/m3"};
-  const float t1[6]    = {C0_THRESHOLD1_PPM, TVOC_THRESHOLD1_PPB, ECO2_THRESHOLD1_PPM, 0, 0, PM25_THRESHOLD1_UGM3};
-  const float t2[6]    = {C0_THRESHOLD2_PPM, TVOC_THRESHOLD2_PPB, ECO2_THRESHOLD2_PPM, 0, 0, PM25_THRESHOLD2_UGM3};
+  const float t1[6]    = {C0_THRESHOLD1_PPM, 0.0f, ECO2_THRESHOLD1_PPM, 0.0f, 0.0f, 0.0f};
+  const float t2[6]    = {C0_THRESHOLD2_PPM, 0.0f, ECO2_THRESHOLD2_PPM, 0.0f, 0.0f, 0.0f};
 
   char buf[18];
   for (int i = 0; i < 6; i++) {
     int x = 6 + (i % 2) * 116;
     int y = 36 + (i / 2) * 78;
     bool ok = s[i]->valid && isfinite(s[i]->average);
+    bool warmup = !ok && ((i == 0 && isCOInWarmup()) || ((i == 1 || i == 2) && isSGP30InWarmup()));
 
     uint16_t border = ST77XX_GREEN;
     uint16_t valCol = ST77XX_WHITE;
-    if (!ok) { border = ST77XX_RED; valCol = ST77XX_RED; }
+    if (warmup) { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
+    else if (!ok) { border = ST77XX_RED; valCol = ST77XX_RED; }
     else if (t2[i] > 0.0f && s[i]->average >= t2[i]) { border = ST77XX_RED; valCol = ST77XX_RED; }
     else if (t1[i] > 0.0f && s[i]->average >= t1[i]) { border = ST77XX_YELLOW; valCol = ST77XX_YELLOW; }
 
@@ -390,8 +395,9 @@ static void drawDashboard(const ProcessedData &data, bool full) {
     lcd.setTextSize(2);
     lcd.setTextColor(valCol, ST77XX_BLACK);
     lcd.setCursor(x + 8, y + 32);
-    if (ok) snprintf(buf, sizeof(buf), "%-7.1f", s[i]->average);
-    else    snprintf(buf, sizeof(buf), "%-7s", "FAULT");
+    if (ok)          snprintf(buf, sizeof(buf), "%-7.1f", s[i]->average);
+    else if (warmup) snprintf(buf, sizeof(buf), "%-7s", "WARMUP");
+    else             snprintf(buf, sizeof(buf), "%-7s", "FAULT");
     lcd.print(buf);
   }
 
