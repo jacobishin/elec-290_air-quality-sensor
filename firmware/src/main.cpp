@@ -42,6 +42,7 @@ Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
  *     5 - Toggle 60-second uptime/storage heartbeat log for endurance testing
  * Set ENABLE_VERIFICATION_TESTS to 0 when done
  */
+
 #define ENABLE_VERIFICATION_TESTS 1
 
 // Wi-Fi & Firebase Realtime Database credentials
@@ -80,10 +81,10 @@ extern const unsigned long TRANSMIT_INTERVAL = 2000UL;   // 2s background Fireba
 
 // Air quality thresholds (CO and eCO2 only; -1.0f = unconfigured placeholder)
 extern const float C0_THRESHOLD1_PPM   = -1.0f;
-extern const float ECO2_THRESHOLD1_PPM = -1.0f;
+extern const float ECO2_THRESHOLD1_PPM = 1000.0f;
 
 extern const float C0_THRESHOLD2_PPM   = 200.0f;
-extern const float ECO2_THRESHOLD2_PPM = 4000.0f;
+extern const float ECO2_THRESHOLD2_PPM = 5000.0f;
 
 const int allowedSensorFaults    = 1;
 const int allowedInvalidReadings = 1;

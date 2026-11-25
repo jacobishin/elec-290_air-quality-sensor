@@ -35,6 +35,7 @@
 </nav>
 
 <section id="view-readings">
+<!-- Logged out -->
 <div id="login-section">
   <input id="device-id" placeholder="Device ID (e.g. monitor-01)">
   <input id="password" type="password" placeholder="Password (6+ characters)">
@@ -43,12 +44,13 @@
   <p id="message"></p>
 </div>
 
+<!-- Logged in -->
 <div id="app" hidden>
   <p>Device: <b id="device-label"></b> <button id="logout-btn">Log out</button></p>
   <button id="add-test-btn">Add test reading</button>
-  <div id="latest"></div>
-  <h2>Recent readings</h2>
-  <div class="scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
+    <div id="latest"></div>
+    <h2>Recent readings</h2>
+    <div class="scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
 </div>
 </section>
 
@@ -72,7 +74,6 @@ import { getFirestore, collection, doc, setDoc, addDoc, query, orderBy, limit, o
 import { getDatabase, ref, set, push, query as rtdQuery, limitToLast, onValue }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
-  //https://gas-monitor-6e3eb-default-rtdb.firebaseio.com
 const firebaseConfig = {
   apiKey: "AIzaSyCInYadRTEuNcRaPqeYl7qe-p3b5zSzplI",
   authDomain: "gas-monitor-6e3eb.firebaseapp.com",
@@ -109,30 +110,8 @@ function el(tag, text, cls) {
   if (cls) e.className = cls;
   return e;
 }
-
-// ---- reading a firmware-format reading: { timestamp_ms, alert_active, co: {avg, count, valid}, ... } ----
-function valueOf(r, key) {
-  const s = r[key];
-  return (s && s.valid !== 0 && s.avg != null) ? Number(s.avg) : null;
-}
-function fmtTime(r) {
-  const t = Number(r.timestamp_ms);               // the firmware currently sends seconds; ms also works
-  return t ? new Date(t < 1e11 ? t * 1000 : t).toLocaleString() : "";
-}
-function gradeOf(r) {
-  if (r.alert_active) return "E";
-  let level = null;
-  for (const [key, [t1, t2]] of Object.entries(THRESHOLDS)) {
-    const v = valueOf(r, key);
-    if (v === null) continue;
-    if (t2 != null && v >= t2) return "E";
-    if (t1 != null && v >= t1) level = "C";
-    else if (level === null && (t1 != null || t2 != null)) level = "A";
-  }
-  return level || "?";
-}
 function gradeBadge(g) {
-  const b = el("span", g, "grade");
+  const b = el("span", g || "?", "grade");
   b.style.background = GRADE_COLORS[g] || "#777";
   return b;
 }
@@ -168,6 +147,7 @@ let deviceId = null, latest = null, unsub = null, registering = false;
 let map = null, pin = null, markers = null;
 
 // ---------- Login: the device ID is the username ----------
+// Firebase logins need an email, so we turn the device ID into a fake one.
 const idToEmail = (id) => id + "@monitor.example";
 
 function readId() {
@@ -296,19 +276,19 @@ function showApp(user) {
 function renderLatest() {
   const box = $("latest");
   box.replaceChildren();
-  if (!latest) { box.append(el("p", "No readings yet.")); return; }
-  const head = el("p", "Latest reading, taken " + fmtTime(latest) + "  ");
-  head.append(gradeBadge(gradeOf(latest)));
-  if (latest.alert_active) head.append(" ALERT ACTIVE");
+  if (!latest) { box.append(el("p", "No readings yet. Click Add test reading.")); return; }
+  const head = el("p", "Latest reading, taken " + fmtTime(latest.timestamp) + "  ");
+  head.append(gradeBadge(latest.grade));
   box.append(head);
   box.append(el("p", description(latest)));
 
   const grid = el("div", undefined, "gases");
-  SENSORS.forEach((s) => {
-    const v = valueOf(latest, s.key);
+  GASES.forEach((g) => {
+    const r = (latest.gases || {})[g.key];
+    if (!r) return;
     const card = el("div", undefined, "gas");
-    card.append(el("span", s.label), el("b", v === null ? "no valid reading" : v + " " + s.unit));
-    if (v !== null && s.base) card.append(el("small", "baseline " + s.base + " (" + (v / s.base).toFixed(1) + "x)"));
+    card.append(el("span", g.label), el("b", r.value + " " + g.unit));
+    card.append(el("small", "baseline " + r.baseline + " (" + (r.value / r.baseline).toFixed(1) + "x)"));
     grid.append(card);
   });
   box.append(grid);
@@ -330,8 +310,6 @@ function renderLatest() {
   const head = el("p", "Latest reading, taken " + fmtTime(latest.timestamp) + "  ");
   head.append(gradeBadge(latest.grade));
   box.append(head);
-  box.append(el("p", description(latest)));
-
   const grid = el("div", undefined, "gases");
   GASES.forEach((g) => {
     const r = (latest.gases || {})[g.key];
@@ -342,8 +320,7 @@ function renderLatest() {
     grid.append(card);
   });
   box.append(grid);
-}
-
+}*/
 function renderTable(rows) {
   const head = $("table-head"), body = $("table-body");
   head.replaceChildren(); body.replaceChildren();
@@ -376,7 +353,7 @@ function renderTable(rows) {
   });
 }*/
 
-// Fake reading in the same format the ESP32 sends.
+// Fake reading. The timestamp stands in for the time the DEVICE took the reading.
 $("add-test-btn").onclick = async () => {
   const now = Math.floor(Date.now() / 1000);
   const reading = { timestamp: now, timestamp_ms: now };
@@ -417,10 +394,10 @@ $("tab-map").onclick = () => openTab("map");
 // ---------- Map tab (public) ----------
 function popupFor(r) {
   const d = el("div");
-  d.append(el("b", r.place), el("br"), gradeBadge(gradeOf(r)), el("br"), el("small", fmtTime(r)));
-  SENSORS.forEach((s) => {
-    const v = valueOf(r, s.key);
-    if (v !== null) d.append(el("br"), el("span", s.key + ": " + v + " " + s.unit));
+  d.append(el("b", r.place), el("br"), gradeBadge(r.grade), el("br"), el("small", fmtTime(r.timestamp)));
+  GASES.forEach((g) => {
+    const v = r.gases && r.gases[g.key];
+    if (v) d.append(el("br"), el("span", g.key + ": " + v.value + " " + g.unit + " (baseline " + v.baseline + ")"));
   });
   return d;
 }
@@ -436,12 +413,12 @@ function initMap() {
     if (pin) pin.setLatLng(e.latlng);
     else pin = L.circleMarker(e.latlng, { radius: 8, color: "#000", weight: 3, fill: false }).addTo(map);
   });
-  const q = query(ref(db, "publicReadings"), orderByChild("timestamp_ms"), limitToLast(200));
-  onValue(q, (snap) => {
+  const q = query(collection(db, "publicReadings"), orderBy("timestamp", "desc"), limit(200));
+  onSnapshot(q, (snap) => {
     markers.clearLayers();
-    snap.forEach((child) => {
-      const r = child.val();
-      L.circleMarker([r.lat, r.lng], { radius: 9, color: GRADE_COLORS[gradeOf(r)] || "#777", fillOpacity: 0.8 })
+    snap.forEach((d) => {
+      const r = d.data();
+      L.circleMarker([r.lat, r.lng], { radius: 9, color: GRADE_COLORS[r.grade] || "#555", fillOpacity: 0.8 })
         .bindPopup(popupFor(r)).addTo(markers);
     });
   }, (err) => alert("Could not load map data: " + err.message));
@@ -453,8 +430,9 @@ $("publish-btn").onclick = async () => {
   if (!pin || !place) return alert("Click the map to drop a pin and type a place name.");
   const ll = pin.getLatLng();
   try {
-    // The reading plus a place; no device ID or account info is copied.
-    await push(ref(db, "publicReadings"), { ...latest, place, lat: ll.lat, lng: ll.lng });
+    // No device ID or account info is copied, so the public data is anonymous.
+    await addDoc(collection(db, "publicReadings"),
+      { place, lat: ll.lat, lng: ll.lng, grade: latest.grade, gases: latest.gases, timestamp: latest.timestamp });
     $("place").value = "";
   } catch (e) { alert("Could not publish: " + e.message); }
 };
