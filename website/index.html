@@ -419,10 +419,10 @@ const firebaseConfig = {
 // EDIT THIS LIST to match the gases your sensors measure.
 // "base" is only used to make fake test readings.
 const GASES = [
-  { key: "CO", dbKey: "co",  label: "Carbon monoxide",  unit: "ppm",   base: 1 },
-  { key: "CO2",  dbKey: "eco2", label: "Estimated Carbon dioxide",   unit: "ppm",   base: 420 },
-  { key: "VOC",  dbKey: "tvoc", label: "VOCs",  unit: "ppb",   base: 50 },
-  { key: "PM25", dbKey: "pm25", label: "PM2.5", unit: "ug/m3", base: 8 }
+  { key: "CO", dbKey: "co",  label: "Carbon monoxide",  unit: "ppm",   base: 10 },
+  { key: "CO2",  dbKey: "eco2", label: "Estimated Carbon dioxide",   unit: "ppm",   base: 1000 },
+  { key: "VOC",  dbKey: "tvoc", label: "VOCs",  unit: "ppb", base: 1},
+  { key: "PM25", dbKey: "pm25", label: "PM2.5", unit: "ug/m3", base: 1}
 ];
 const MISCELLANEOUS = [
         { key: "TEMP", dbKey: "temp", label: "Temperature", unit: "°C"},
@@ -449,31 +449,42 @@ function gradeBadge(g) {
 }
 function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 
-const GRADE_WORDS = {A: "Amazing", B: "Good", C: "Okay", D: "Bad", F: "Very Bad"};
-const HIGH_RATIO = 2;
+const GRADE_WORDS = {A: "Amazing", B: "Good", C: "Moderate", D: "Dangerous", F: "Dangerous Immediately"};
+const GRADED = ["CO", "CO2"];
 
-function gradeFrom(gases){
-  const ratios = Object.values(gases).filter((x) => x.baseline).map((x) => x.value/x.baseline);
+function gradeFrom(gases) {
+  const ratios = Object.entries(gases)
+          .filter(([key, x]) => GRADED.includes(key) && x.baseline)
+          .map(([key, x]) => x.value / x.baseline);
   if (!ratios.length) return undefined;
   const worst = Math.max(...ratios);
-  return worst < 1.5 ? "A" : worst < 2 ? "B" : worst < 2.5 ? "C" : worst < 3 ? "D" : "F";
+  return worst < 1 ? "A" : worst < 6 ? "B" : worst < 10 ? "C" : worst < 20 ? "D" : "F";
 }
-function description(r){
-  const ratios = GASES
-          .map((g) => {
-            const x = r.gases && r.gases[g.key];
-            return x && x.baseline ? {key: g.key, ratio: x.value/x.baseline} : null;
-          })
-          .filter(Boolean);
+function describeCO(x) {
+  if (!x || !x.baseline) return null;
+  const ratio = x.value / x.baseline;
+  if (ratio < 1) return "CO normal";
+  if (ratio < 6)   return "CO slightly high, ventilate area";
+  if (ratio < 10)   return "CO is high, leave now";
+  if (ratio < 20) return "CO is very high, risk of dizziness and headaches"
+  return "CO is extremely high, loss of consciousness likely";
+}
 
-  const high = ratios.filter((x) => x.ratio >= HIGH_RATIO)
-          .sort((a, b) => b.ratio - a.ratio);
+function describeCO2(x) {
+  if (!x || !x.baseline) return null;
+  const ratio = x.value / x.baseline;
+  if (ratio < 1) return "CO2 normal";
+  if (ratio < 6)   return "CO2 slightly raised, ventilation is likely poor";
+  if (ratio < 10)   return "Maximum OSHA safe limit";
+  if (ratio < 20) return "C02 levels very high, confusion and increased heart rate likely"
+  return "Risk of asphyxyation, leave area immediately";
+}
+
+function description(r) {
   const word = GRADE_WORDS[r.grade] || "Unknown";
-
-  if (!ratios.length) return word;
-  if (!high.length) return word + ": all gases near baseline";
-  return word + ": elevated " +
-          high.map((x) => x.key + " (" + x.ratio.toFixed(1) + "x)").join(", ");
+  const g = r.gases || {};
+  const parts = [describeCO(g.CO), describeCO2(g.CO2)].filter(Boolean);
+  return parts.length ? word + ": " + parts.join("; ") : word;
 }
 let deviceId = null, latest = null, unsub = null, registering = false;
 let selectedReading = null;
