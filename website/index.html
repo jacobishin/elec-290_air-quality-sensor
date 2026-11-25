@@ -7,23 +7,354 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   [hidden] { display: none !important; }
-  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 0 auto; padding: 16px; color: #1d2a2e; background: #f6f8f7; }
-  h1 { font-size: 1.5rem; margin: 0 0 12px; }
-  input, button { font: inherit; padding: 6px 10px; margin: 2px 0; }
-  button { cursor: pointer; }
-  nav { display: flex; gap: 8px; margin: 12px 0; }
-  nav button.active { background: #1d2a2e; color: #fff; }
-  .grade { display: inline-block; min-width: 2rem; text-align: center; padding: 2px 10px; border-radius: 4px; color: #fff; font-weight: 700; }
-  .gases { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 12px 0; }
-  .gas { background: #fff; border: 1px solid #cfd8d6; padding: 8px; }
-  .gas b { display: block; font-size: 1.2rem; }
-  .gas small { color: #52646a; }
-  table { border-collapse: collapse; width: 100%; background: #fff; font-size: .9rem; }
-  th, td { border: 1px solid #cfd8d6; padding: 5px 8px; text-align: left; }
-  td.summary {min-width: 180px; max-width: 280px; white-space: normal; }
-  .scroll { overflow-x: auto; }
-  #map { height: 380px; border: 1px solid #cfd8d6; margin: 8px 0; }
-  #message { color: #b00020; }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+
+  :root {
+    --bg: #f7f9f8;
+    --surface: #ffffff;
+    --border: #e2e8e6;
+    --border-strong: #cdd6d3;
+    --text: #16201e;
+    --muted: #5d6d69;
+    --accent: #16201e;
+    --accent-hover: #2c3b38;
+    --danger: #b42318;
+    --radius: 8px;
+  }
+
+  body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 32px 20px 64px;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0 0 18px;
+  }
+
+  h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 28px 0 12px;
+  }
+
+  p {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 0.94rem;
+  }
+
+  /* Navigation segmented control */
+  nav {
+    display: inline-flex;
+    gap: 4px;
+    padding: 4px;
+    margin: 0 0 24px;
+    background: #e9eeec;
+    border-radius: 10px;
+  }
+
+  nav button {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 0.9rem;
+    font-weight: 500;
+    padding: 7px 14px;
+    margin: 0;
+    border-radius: 7px;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+
+  nav button:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.5);
+  }
+
+  nav button.active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  }
+
+  /* Inputs & Buttons */
+  input, button {
+    font: inherit;
+    font-size: 0.92rem;
+    border-radius: var(--radius);
+    transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+  }
+
+  input {
+    padding: 9px 12px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+  }
+
+  input::placeholder {
+    color: #8c9b97;
+  }
+
+  input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(22, 32, 30, 0.08);
+  }
+
+  button {
+    cursor: pointer;
+    padding: 8px 14px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  button:hover {
+    background: #f1f4f3;
+    border-color: #b7c3bf;
+  }
+
+  button:active {
+    transform: translateY(0.5px);
+  }
+
+  /* Primary actions */
+  #login-btn, #publish-btn {
+    background: var(--accent);
+    color: #ffffff;
+    border-color: var(--accent);
+  }
+
+  #login-btn:hover, #publish-btn:hover {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+
+  /* Login card */
+  #login-section {
+    max-width: 360px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+  }
+
+  #login-section input,
+  #login-section button {
+    width: 100%;
+    margin: 0;
+  }
+
+  #login-btn {
+    margin-top: 6px;
+  }
+
+  #message {
+    color: var(--danger);
+    font-size: 0.86rem;
+    margin: 4px 0 0;
+  }
+
+  #message:empty {
+    display: none;
+  }
+
+  /* Logged-in header row */
+  #app > p:first-child {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 16px;
+    margin-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  #device-label {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  #logout-btn {
+    margin-left: auto;
+    padding: 5px 11px;
+    font-size: 0.84rem;
+    color: var(--muted);
+  }
+
+  #add-test-btn {
+    margin-bottom: 20px;
+    font-size: 0.88rem;
+  }
+
+  /* Latest reading & gas cards */
+  #latest > p {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+    font-size: 0.9rem;
+  }
+
+  .grade {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.9rem;
+    padding: 2px 10px;
+    border-radius: 6px;
+    color: #ffffff;
+    font-size: 0.84rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+
+  .gases {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin: 12px 0 8px;
+  }
+
+  .gas {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  }
+
+  .gas span {
+    display: block;
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--muted);
+  }
+
+  .gas b {
+    display: block;
+    font-size: 1.45rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--text);
+    margin: 6px 0 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .gas small {
+    display: block;
+    font-size: 0.78rem;
+    color: #778783;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Recent readings table */
+  .scroll {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  th, td {
+    padding: 10px 14px;
+    text-align: left;
+    border: none;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  th {
+    background: #fafcfb;
+    color: var(--muted);
+    font-size: 0.76rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  tbody tr:hover {
+    background: #fafcfb;
+  }
+
+  td.summary {
+    min-width: 180px;
+    max-width: 280px;
+    white-space: normal;
+    color: var(--muted);
+  }
+
+  /* Map & publish box */
+  #map {
+    height: 420px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin: 12px 0 16px;
+    overflow: hidden;
+  }
+
+  #publish-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+
+  #publish-box p {
+    flex: 1 0 100%;
+    margin: 0 0 4px;
+    font-size: 0.88rem;
+  }
+
+  #place {
+    flex: 1 1 240px;
+  }
+
+  /* Keep Leaflet popups tidy */
+  .leaflet-popup-content {
+    font-family: inherit;
+    font-size: 0.86rem;
+    line-height: 1.5;
+  }
+
+  .leaflet-popup-content .grade {
+    margin: 4px 0;
+  }
 </style>
 </head>
 <body>
