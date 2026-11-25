@@ -674,16 +674,30 @@ function initMap() {
 }
 
 $("publish-btn").onclick = async () => {
-  const place = $("place").value.trim();
-  if (!latest) return alert("You need a reading first.");
-  if (!pin || !place) return alert("Click the map to drop a pin and type a place name.");
-  const ll = pin.getLatLng();
-  try {
-    // No device ID or account info is copied, so the public data is anonymous.
-    await addDoc(collection(db, "publicReadings"),
-      { place, lat: ll.lat, lng: ll.lng, grade: latest.grade, gases: latest.gases, timestamp: latest.timestamp });
-    $("place").value = "";
-  } catch (e) { alert("Could not publish: " + e.message); }
+ const place = $("place").value.trim();
+ const readingToPublish = selectedReading || latest;
+ if (!readingToPublish)
+  return alert("You need a reading first.");
+ if (!pin || !place)
+  return alert("Click the map to drop a pin and type a place name.");
+ const ll = pin.getLatLng();
+ try {
+  await addDoc(collection(db, "publicReadings"),
+  {
+   place,
+   lat: ll.lat,
+   lng: ll.lng,
+   grade: readingToPublish.grade,
+   gases: readingToPublish.gases,
+   timestamp: readingToPublish.timestamp
+  });
+  selectedReading = null;
+  $("selected-reading-status").textContent = "";
+  $("place").value = "";
+  alert("Reading published!");
+ } catch (e) {
+  alert("Could not publish: " + e.message);
+ }
 };
 </script>
 </body>
