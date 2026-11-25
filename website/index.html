@@ -387,11 +387,12 @@
 
 <section id="view-map" hidden>
   <p>Readings published by users. No login needed to view.</p>
+  <p id="selected-reading-status"></p>
   <div id="map"></div>
   <div id="publish-box" hidden>
     <p>To add yours: click the map to drop a pin, type the place name, then publish your latest reading.</p>
     <input id="place" placeholder="Place name (e.g. Stauffer Library)">
-    <button id="publish-btn">Publish latest reading here</button>
+    <button id="publish-btn">Publish selected reading here</button>
   </div>
 </section>
 
@@ -475,6 +476,7 @@ function description(r){
           high.map((x) => x.key + " (" + x.ratio.toFixed(1) + "x)").join(", ");
 }
 let deviceId = null, latest = null, unsub = null, registering = false;
+let selectedReading = null;
 let map = null, pin = null, markers = null;
 
 // ---------- Login: the device ID is the username ----------
@@ -595,22 +597,66 @@ function renderLatest() {
   });
   box.append(miscGrid);
 }
+
 function renderTable(rows) {
-  const head = $("table-head"), body = $("table-body");
-  head.replaceChildren(); body.replaceChildren();
-  const hr = el("tr");
-  ["Device time", "Grade", "Summary",
-    ...GASES.map((g) => g.key + " (" + g.unit + ")"),
-    ...MISCELLANEOUS.map((m) => m.label + " (" + m.unit + ")")
-  ].forEach((t) => hr.append(el("th", t)));
-  head.append(hr);
-  rows.forEach((r) => {
-    const tr = el("tr");
-    tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade), el("td", description(r), "summary"));
-    GASES.forEach((g) => tr.append(el("td", (r.gases && r.gases[g.key]) ? r.gases[g.key].value : "")));
-    MISCELLANEOUS.forEach((m) => tr.append(el("td", (r.miscellaneous && r.miscellaneous[m.key] !== undefined) ? r.miscellaneous[m.key] : "")));
-    body.append(tr);
-  });
+ const head = $("table-head");
+ const body = $("table-body");
+ head.replaceChildren();
+ body.replaceChildren();
+ const hr = el("tr");
+ [
+  "Device time",
+  "Grade",
+  "Summary",
+  ...GASES.map((g) => g.key + " (" + g.unit + ")"),
+  ...MISCELLANEOUS.map((m) => m.label + " (" + m.unit + ")"),
+  "Actions"
+ ].forEach((t) => hr.append(el("th", t)));
+ head.append(hr);
+ rows.forEach((r) => {
+  const tr = el("tr");
+  tr.append(
+   el("td", fmtTime(r.timestamp)),
+   el("td", r.grade),
+   el("td", description(r), "summary")
+  );
+  GASES.forEach((g) =>
+   tr.append(
+    el(
+     "td",
+     (r.gases && r.gases[g.key])
+      ? r.gases[g.key].value
+      : ""
+    )
+   )
+  );
+  MISCELLANEOUS.forEach((m) =>
+   tr.append(
+    el(
+     "td",
+     (r.miscellaneous &&
+      r.miscellaneous[m.key] !== undefined)
+      ? r.miscellaneous[m.key]
+      : ""
+    )
+   )
+  );
+  const actionTd = el("td");
+  const publishBtn = el("button", "Publish");
+  publishBtn.onclick = () => {
+
+   selectedReading = r;
+
+   $("selected-reading-status").textContent =
+    "Selected reading: " +
+    fmtTime(r.timestamp);
+
+   openTab("map");
+  };
+  actionTd.append(publishBtn);
+  tr.append(actionTd);
+  body.append(tr);
+ });
 }
 
 // Fake reading. The timestamp stands in for the time the DEVICE took the reading.
