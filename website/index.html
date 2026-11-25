@@ -67,14 +67,15 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getDatabase, ref, push, set, query, orderByChild, limitToLast, onValue }
+import { getFirestore, collection, doc, setDoc, addDoc, query, orderBy, limit, onSnapshot, Timestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getDatabase, ref, set, push, query as rtdQuery, limitToLast, onValue }
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
   //https://gas-monitor-6e3eb-default-rtdb.firebaseio.com
 const firebaseConfig = {
   apiKey: "AIzaSyCInYadRTEuNcRaPqeYl7qe-p3b5zSzplI",
   authDomain: "gas-monitor-6e3eb.firebaseapp.com",
-  // REPLACE with the exact URL shown at the top of Realtime Database -> Data in the Firebase console
   databaseURL: "https://gas-monitor-6e3eb-default-rtdb.firebaseio.com",
   projectId: "gas-monitor-6e3eb",
   storageBucket: "gas-monitor-6e3eb.firebasestorage.app",
@@ -82,24 +83,24 @@ const firebaseConfig = {
   appId: "1:1041203123160:web:6a371b01318ea9ad9998ad"
 };
 
-// Keys match the firmware's names (co, tvoc, eco2, temp, hum, pm25).
-// "base" = clean-air baseline shown on the website (null = no baseline). Edit to the team's numbers.
-const SENSORS = [
-  { key: "co",   label: "Carbon monoxide",       unit: "ppm",   base: 5 },
-  { key: "eco2", label: "Carbon dioxide (eCO2)", unit: "ppm",   base: 400 },
-  { key: "tvoc", label: "TVOC",                  unit: "ppb",   base: 200 },
-  { key: "pm25", label: "PM2.5",                 unit: "ug/m3", base: 8 },
-  { key: "temp", label: "Temperature",           unit: "C",     base: null },
-  { key: "hum",  label: "Humidity",              unit: "%",     base: null }
+// EDIT THIS LIST to match the gases your sensors measure.
+// "base" is only used to make fake test readings.
+const GASES = [
+  { key: "CO", dbKey: "co",  label: "Carbon monoxide",  unit: "ppm",   base: 1 },
+  { key: "CO2",  dbKey: "eco2", label: "Estimated Carbon dioxide",   unit: "ppm",   base: 420 },
+  { key: "VOC",  dbKey: "tvoc", label: "VOCs",  unit: "ppb",   base: 50 },
+  { key: "PM25", dbKey: "pm25", label: "PM2.5", unit: "ug/m3", base: 8 }
 ];
-// Grade thresholds [first, danger], same idea as the firmware's THRESHOLD1 / THRESHOLD2.
-// null = not decided yet. While none are set, the grade shows "?" (an active alert still shows E).
-const THRESHOLDS = { co: [null, null], eco2: [null, null], tvoc: [null, null], pm25: [null, null] };
+const MISCELLANEOUS = [
+        { key: "TEMP", dbKey: "temp", label: "Temperature", unit: "°C"},
+        { key: "HUM", dbKey: "hum", label: "Humidity", unit: "%"}
+        ];
 const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", F: "#c62828" };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = getDatabase(app);
+const db = getFirestore(app);
+const rtdb = getDatabase(app);
 const $ = (id) => document.getElementById(id);
 
 function el(tag, text, cls) {
@@ -139,6 +140,13 @@ function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 
 const GRADE_WORDS = {A: "Amazing", B: "Good", C: "Okay", D: "Bad", F: "Very Bad"};
 const HIGH_RATIO = 2;
+
+function gradeFrom(gases){
+  const ratios = Object.values(gases).filter((x) => x.baseline).map((x) => x.value/x.baseline);
+  if (!ratios.length) return undefined;
+  const worst = Math.max(...ratios);
+  return worst < 1.5 ? "A" : worst < 2 ? "B" : worst < 2.5 ? "C" : worst < 3 ? "D" : "F";
+}
 function description(r){
   const ratios = GASES
           .map((g) => {
@@ -152,7 +160,7 @@ function description(r){
   const word = GRADE_WORDS[r.grade] || "Unknown";
 
   if (!ratios.length) return word;
-  if (!high.length) return word + ": all gasses near baseline";
+  if (!high.length) return word + ": all gases near baseline";
   return word + ": elevated " +
           high.map((x) => x.key + " (" + x.ratio.toFixed(1) + "x)").join(", ");
 }
@@ -182,7 +190,8 @@ $("register-btn").onclick = async () => {
   registering = true;
   try {
     const cred = await createUserWithEmailAndPassword(auth, idToEmail(id), $("password").value);
-    await set(ref(db, "deviceOwners/" + id), cred.user.uid);   // links this device ID to this account
+    await setDoc(doc(db, "devices", id), { ownerUid: cred.user.uid });
+    await set(ref(rtdb, "deviceOwners/" + id), cred.user.uid);
     registering = false;
     showApp(cred.user);
   } catch (e) {
@@ -206,7 +215,6 @@ function showLogin() {
   $("app").hidden = true;
   $("publish-box").hidden = true;
 }
-
 function showApp(user) {
   deviceId = user.email.split("@")[0];
   $("device-label").textContent = deviceId;
@@ -215,17 +223,74 @@ function showApp(user) {
   $("publish-box").hidden = false;
   $("message").textContent = "";
   if (unsub) unsub();
-  // The ESP32 adds readings at devices/<id>/readings
-  const q = query(ref(db, "devices/" + deviceId + "/readings"), orderByChild("timestamp_ms"), limitToLast(10));
+
+  const q = rtdQuery(ref(rtdb, "devices/" + deviceId + "/readings"), limitToLast(10));
   unsub = onValue(q, (snap) => {
     const rows = [];
-    snap.forEach((child) => { rows.push(child.val()); });
-    rows.reverse();                                   // newest first
+    snap.forEach((child) => {
+      const v = child.val();
+      if (!v.timestamp) return;
+      const gases = {}, miscellaneous = {};
+      GASES.forEach((g) => {
+        const x = v[g.dbKey];
+        if (x && x.valid !== 0) gases[g.key] = { value: Math.round(x.avg * 100) / 100, baseline: g.base };
+      });
+      MISCELLANEOUS.forEach((m) => {
+        const x = v[m.dbKey];
+        if (x && x.valid !== 0) miscellaneous[m.key] = Math.round(x.avg * 10) / 10;
+      });
+      rows.push({
+        timestamp: Timestamp.fromMillis(v.timestamp * 1000),
+        grade: v.grade || gradeFrom(gases),
+        gases,
+        miscellaneous
+      });
+    });
+    rows.reverse();
     latest = rows[0] || null;
     renderLatest();
     renderTable(rows);
   }, (err) => alert("Could not read: " + err.message));
 }
+/*function showApp(user) {
+  deviceId = user.email.split("@")[0];
+  $("device-label").textContent = deviceId;
+  $("login-section").hidden = true;
+  $("app").hidden = false;
+  $("publish-box").hidden = false;
+  $("message").textContent = "";
+  if (unsub) unsub();
+  // Readings live under the device: devices/<id>/readings
+  /*const q = query(collection(db, "devices", deviceId, "readings"), orderBy("timestamp", "desc"), limit(10));
+  unsub = onSnapshot(q, (snap) => {
+    const rows = snap.docs.map((d) => d.data());
+  const q = query(ref(rtdb, "devices/" + deviceId + "/readings"), limitToLast(10));
+  unsub = onValue(q, (snap) => {
+    const rows = [];
+    snap.forEach((child) => {
+      const v = child.val();
+      if (!v.timestamp) return;
+      const gases = {}, miscellaneous = {};
+      GASES.forEach((g) => {
+        const x = v[g.dbkey];
+        if (x && x.valid !== 0) gases[g.key] = { value: Math.round(x.avg * 100) / 100, baseline: g.base};
+      });
+      MISCELLANEOUS.forEach((m) => {
+        const x = v[m.dbKey];
+        if (x && x.valid !== 0) miscellaneous[m.key] = Math.round(x.avg*10)/10;
+      });
+      rows.push({
+        timestamp: Time.fromMillis(v.timestamp * 1000),
+        grade: v.grade || gradeFrom(gases),
+        gases,
+        miscellaneous,
+      });
+    });
+    latest = rows[0] || null;
+    renderLatest();
+    renderTable(rows);
+  }, (err) => alert("Could not read: " + err.message));
+}*/
 
 // ---------- Readings tab ----------
 function renderLatest() {
@@ -236,6 +301,8 @@ function renderLatest() {
   head.append(gradeBadge(gradeOf(latest)));
   if (latest.alert_active) head.append(" ALERT ACTIVE");
   box.append(head);
+  box.append(el("p", description(latest)));
+
   const grid = el("div", undefined, "gases");
   SENSORS.forEach((s) => {
     const v = valueOf(latest, s.key);
@@ -245,9 +312,56 @@ function renderLatest() {
     grid.append(card);
   });
   box.append(grid);
+
+  const miscGrid = el("div", undefined, "gases");
+  MISCELLANEOUS.forEach((m) => {
+    const val = (latest.miscellaneous || {})[m.key];
+    if (val === undefined) return;
+    const card = el("div", undefined, "gas");
+    card.append(el("span", m.label), el("b", val + " " + m.unit));
+    miscGrid.append(card);
+  });
+  box.append(miscGrid);
+}
+/*function renderLatest() {
+  const box = $("latest");
+  box.replaceChildren();
+  if (!latest) { box.append(el("p", "No readings yet. Click Add test reading.")); return; }
+  const head = el("p", "Latest reading, taken " + fmtTime(latest.timestamp) + "  ");
+  head.append(gradeBadge(latest.grade));
+  box.append(head);
+  box.append(el("p", description(latest)));
+
+  const grid = el("div", undefined, "gases");
+  GASES.forEach((g) => {
+    const r = (latest.gases || {})[g.key];
+    if (!r) return;
+    const card = el("div", undefined, "gas");
+    card.append(el("span", g.label), el("b", r.value + " " + g.unit));
+    card.append(el("small", "baseline " + r.baseline + " (" + (r.value / r.baseline).toFixed(1) + "x)"));
+    grid.append(card);
+  });
+  box.append(grid);
 }
 
 function renderTable(rows) {
+  const head = $("table-head"), body = $("table-body");
+  head.replaceChildren(); body.replaceChildren();
+  const hr = el("tr");
+  ["Device time", "Grade", "Summary",
+    ...GASES.map((g) => g.key + " (" + g.unit + ")"),
+    ...MISCELLANEOUS.map((m) => m.label + " (" + m.unit + ")")
+  ].forEach((t) => hr.append(el("th", t)));
+  head.append(hr);
+  rows.forEach((r) => {
+    const tr = el("tr");
+    tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade), el("td", description(r), "summary"));
+    GASES.forEach((g) => tr.append(el("td", (r.gases && r.gases[g.key]) ? r.gases[g.key].value : "")));
+    MISCELLANEOUS.forEach((m) => tr.append(el("td", (r.miscellaneous && r.miscellaneous[m.key] !== undefined) ? r.miscellaneous[m.key] : "")));
+    body.append(tr);
+  });
+}
+/*function renderTable(rows) {
   const head = $("table-head"), body = $("table-body");
   head.replaceChildren(); body.replaceChildren();
   const hr = el("tr");
@@ -257,22 +371,37 @@ function renderTable(rows) {
     const tr = el("tr");
     tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade), el("td", description(r), "summary"));
     GASES.forEach((g) => tr.append(el("td", (r.gases && r.gases[g.key]) ? r.gases[g.key].value : "")));
+    MISCELLANEOUS.forEach((m) => tr.append(el("td", (r.extras && r.extras[m.key] !== undefined) ? r.extras[m.key] : "")));
     body.append(tr);
   });
-}
+}*/
 
 // Fake reading in the same format the ESP32 sends.
 $("add-test-btn").onclick = async () => {
-  const r = { timestamp_ms: Math.floor(Date.now() / 1000), alert_active: 0 };
-  SENSORS.forEach((s) => {
-    r[s.key] = { avg: +((s.base || 20) * (0.5 + Math.random() * 3)).toFixed(2), count: 60, valid: 1 };
+  const now = Math.floor(Date.now() / 1000);
+  const reading = { timestamp: now, timestamp_ms: now };
+  GASES.forEach((g) => {
+    reading[g.dbKey] = { avg: +(g.base * (0.5 + Math.random() * 3)).toFixed(2), count: 10, valid: 1 };
   });
-  const grade = "ABCDF"[Math.floor(Math.random() * 5)];
+  MISCELLANEOUS.forEach((m) => {
+    const avg = m.key === "TEMP" ? 20 + Math.random() * 10 : 35 + Math.random() * 30;
+    reading[m.dbKey] = { avg: +avg.toFixed(1), count: 10, valid: 1 };
+  });
+  try {
+    await push(ref(rtdb, "devices/" + deviceId + "/readings"), reading);
+  } catch (e) { alert("Could not save: " + e.message); }
+};
+/*$("add-test-btn").onclick = async () => {
+  const gases = {};
+  GASES.forEach((g) => {
+    gases[g.key] = { value: +(g.base * (0.5 + Math.random() * 3)).toFixed(2), baseline: g.base };
+  });
+  const grade = gradeFrom(gases);
   try {
     await addDoc(collection(db, "devices", deviceId, "readings"),
       { timestamp: Timestamp.fromDate(new Date()), grade, gases });
   } catch (e) { alert("Could not save: " + e.message); }
-};
+};*/
 
 // ---------- Tabs ----------
 function openTab(name) {
