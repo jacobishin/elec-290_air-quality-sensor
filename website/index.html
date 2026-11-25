@@ -20,6 +20,7 @@
   .gas small { color: #52646a; }
   table { border-collapse: collapse; width: 100%; background: #fff; font-size: .9rem; }
   th, td { border: 1px solid #cfd8d6; padding: 5px 8px; text-align: left; }
+  td.summary {min-width: 180px; max-width: 280px; white-space: normal; }
   .scroll { overflow-x: auto; }
   #map { height: 380px; border: 1px solid #cfd8d6; margin: 8px 0; }
   #message { color: #b00020; }
@@ -94,7 +95,7 @@ const SENSORS = [
 // Grade thresholds [first, danger], same idea as the firmware's THRESHOLD1 / THRESHOLD2.
 // null = not decided yet. While none are set, the grade shows "?" (an active alert still shows E).
 const THRESHOLDS = { co: [null, null], eco2: [null, null], tvoc: [null, null], pm25: [null, null] };
-const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", E: "#c62828" };
+const GRADE_COLORS = { A: "#2e7d32", B: "#7cb342", C: "#f9a825", D: "#ef6c00", F: "#c62828" };
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -134,7 +135,27 @@ function gradeBadge(g) {
   b.style.background = GRADE_COLORS[g] || "#777";
   return b;
 }
+function fmtTime(ts) { return ts ? ts.toDate().toLocaleString() : ""; }
 
+const GRADE_WORDS = {A: "Amazing", B: "Good", C: "Okay", D: "Bad", F: "Very Bad"};
+const HIGH_RATIO = 2;
+function description(r){
+  const ratios = GASES
+          .map((g) => {
+            const x = r.gases && r.gases[g.key];
+            return x && x.baseline ? {key: g.key, ratio: x.value/x.baseline} : null;
+          })
+          .filter(Boolean);
+
+  const high = ratios.filter((x) => x.ratio >= HIGH_RATIO)
+          .sort((a, b) => b.ratio - a.ratio);
+  const word = GRADE_WORDS[r.grade] || "Unknown";
+
+  if (!ratios.length) return word;
+  if (!high.length) return word + ": all gasses near baseline";
+  return word + ": elevated " +
+          high.map((x) => x.key + " (" + x.ratio.toFixed(1) + "x)").join(", ");
+}
 let deviceId = null, latest = null, unsub = null, registering = false;
 let map = null, pin = null, markers = null;
 
@@ -230,12 +251,12 @@ function renderTable(rows) {
   const head = $("table-head"), body = $("table-body");
   head.replaceChildren(); body.replaceChildren();
   const hr = el("tr");
-  ["Device time", "Grade", ...SENSORS.map((s) => s.key + " (" + s.unit + ")")].forEach((t) => hr.append(el("th", t)));
+  ["Device time", "Grade", "Summary", ...GASES.map((g) => g.key + " (" + g.unit + ")")].forEach((t) => hr.append(el("th", t)));
   head.append(hr);
   rows.forEach((r) => {
     const tr = el("tr");
-    tr.append(el("td", fmtTime(r)), el("td", gradeOf(r)));
-    SENSORS.forEach((s) => { const v = valueOf(r, s.key); tr.append(el("td", v === null ? "-" : v)); });
+    tr.append(el("td", fmtTime(r.timestamp)), el("td", r.grade), el("td", description(r), "summary"));
+    GASES.forEach((g) => tr.append(el("td", (r.gases && r.gases[g.key]) ? r.gases[g.key].value : "")));
     body.append(tr);
   });
 }
@@ -246,8 +267,11 @@ $("add-test-btn").onclick = async () => {
   SENSORS.forEach((s) => {
     r[s.key] = { avg: +((s.base || 20) * (0.5 + Math.random() * 3)).toFixed(2), count: 60, valid: 1 };
   });
-  try { await push(ref(db, "devices/" + deviceId + "/readings"), r); }
-  catch (e) { alert("Could not save: " + e.message); }
+  const grade = "ABCDF"[Math.floor(Math.random() * 5)];
+  try {
+    await addDoc(collection(db, "devices", deviceId, "readings"),
+      { timestamp: Timestamp.fromDate(new Date()), grade, gases });
+  } catch (e) { alert("Could not save: " + e.message); }
 };
 
 // ---------- Tabs ----------
