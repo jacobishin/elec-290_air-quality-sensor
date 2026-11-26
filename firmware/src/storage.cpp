@@ -68,6 +68,31 @@ static QueueHandle_t firebaseUploadQueue = nullptr;
 static QueueHandle_t firebaseResultQueue = nullptr;
 static bool uploadInFlight               = false;
 static unsigned long lastTransmission    = 0;
+static unsigned long lastNtpTriggerMs    = 0;
+static bool ntpRequestedAfterConnect     = false;
+
+static void syncNtpIfNeeded(unsigned long nowMs) {
+  if (!timeSyncedThisBoot) {
+    time_t nowSec = time(nullptr);
+    if (nowSec > 1700000000) {
+      timeSyncedThisBoot = true;
+      bootEpochSec       = static_cast<unsigned long>(nowSec) - (nowMs / 1000UL);
+      return;
+    }
+  }
+
+  // Trigger NTP once Wi-Fi is actually connected (and retry every 15s until synced)
+  // so an early pre-Wi-Fi configTime() call doesn't get stuck in lwIP SNTP backoff.
+  if (wifiConnected && !timeSyncedThisBoot) {
+    if (!ntpRequestedAfterConnect || (nowMs - lastNtpTriggerMs >= 15000UL)) {
+      ntpRequestedAfterConnect = true;
+      lastNtpTriggerMs         = nowMs;
+      configTime(0, 0, "time.google.com", "pool.ntp.org", "time.nist.gov");
+    }
+  } else if (!wifiConnected) {
+    ntpRequestedAfterConnect = false;
+  }
+}
 
 // ============================================================
 // LITTLEFS STORAGE
@@ -166,6 +191,7 @@ void initializeStorage() {
 void storeData(const ProcessedData &data) {
   if (faults.storage.status) return;
 
+  syncNtpIfNeeded(millis());
   time_t now = time(nullptr);
   unsigned long timestampSec = (now > 1700000000) ? static_cast<unsigned long>(now) : (data.windowEndTimestamp / 1000);
 
@@ -213,7 +239,8 @@ void storeData(const ProcessedData &data) {
 // ============================================================
 // CSV to JSON to CLOUD
 // ============================================================
-static bool csvLineToJson(char* csvLine, char* jsonOut, size_t jsonOutSize) {
+static bool csvLineToJson(char* csvLine, char* jsonOut, size_t jsonOutSize, bool &needsNtpWait) {
+  needsNtpWait = false;
   if (strncmp(csvLine, "timestamp", 9) == 0 || strncmp(csvLine, "seconds,", 8) == 0) return false;
 
   char* tok[20];
@@ -222,7 +249,11 @@ static bool csvLineToJson(char* csvLine, char* jsonOut, size_t jsonOutSize) {
   if (n < 20) return false;
 
   unsigned long ts = strtoul(tok[0], nullptr, 10);
-  if (ts < 1700000000UL && bootEpochSec > 0) {
+  if (ts < 1700000000UL) {
+    if (!timeSyncedThisBoot || bootEpochSec == 0) {
+      needsNtpWait = true; // Hold upload until NTP syncs so we never send raw boot seconds
+      return false;
+    }
     ts += bootEpochSec;
   }
 
@@ -314,7 +345,11 @@ static void transmitData() {
   job.nextOffset = nextOffset;
   job.fileIndex  = activeLogFileIndex;
 
-  if (len == 0 || !csvLineToJson(line, job.json, sizeof(job.json))) {
+  bool needsNtpWait = false;
+  if (len == 0 || !csvLineToJson(line, job.json, sizeof(job.json), needsNtpWait)) {
+    if (needsNtpWait) {
+      return; // Keep offset unchanged and retry once NTP syncs
+    }
     lastUploadedByteOffset = nextOffset;
     syncPrefs.putUInt("upload_offset", lastUploadedByteOffset);
     recountLogEntries();
@@ -336,9 +371,6 @@ void initializeCommunication() {
   WiFi.setAutoReconnect(true); // Non-blocking background reconnect
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // Background NTP time synchronization (UTC / Unix Epoch)
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
   // Launch Core 0 HTTPS upload worker (8 KB stack for mbedTLS)
   firebaseUploadQueue = xQueueCreate(1, sizeof(UploadJob));
   firebaseResultQueue = xQueueCreate(1, sizeof(UploadResult));
@@ -358,17 +390,12 @@ void initializeCommunication() {
 void checkWiFiConnection() {
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   faultDetections(WIFI, wifiConnected);
-
-  if (wifiConnected && !timeSyncedThisBoot) {
-    time_t now = time(nullptr);
-    if (now > 1700000000) {
-      timeSyncedThisBoot = true;
-      bootEpochSec       = static_cast<unsigned long>(now) - (millis() / 1000);
-    }
-  }
+  syncNtpIfNeeded(millis());
 }
 
 void pollFirebaseSync(unsigned long currentTime) {
+  syncNtpIfNeeded(currentTime);
+
   if (uploadInFlight && firebaseResultQueue) {
     UploadResult res;
     if (xQueueReceive(firebaseResultQueue, &res, 0) == pdTRUE) {

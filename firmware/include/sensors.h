@@ -12,7 +12,7 @@
 // Single-line switch:
 // 0 = Regular/Direct mode (constant 5V, no voltage divider, 0.5s polling, no warmup delay)
 // 1 = Analog Heater-Cycle mode (S8050 PWM on GPIO 14 + 10k/20k divider on GPIO 36, 150s cycle)
-#define MQ7_USE_HEATER_CIRCUIT 0
+#define MQ7_USE_HEATER_CIRCUIT 1
 
 // ============================================================
 // DATA STRUCTURES
