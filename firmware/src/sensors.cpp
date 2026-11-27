@@ -57,6 +57,10 @@ static unsigned long lastMQ7Read     = 0;
 static unsigned long lastSGP30Read   = 0;
 static unsigned long lastTempHumRead = 0;
 
+static uint16_t eCO2_base = 40332;
+static uint16_t TVOC_base = 43346;
+static uint16_t sout = 0;
+
 // ============================================================
 // ACCUMULATOR HELPERS
 // ============================================================
@@ -143,9 +147,12 @@ static bool readMQ7() {
     return false;
   }
 
+  float H2PPM = pow(0.5, (15325.5-sout)/512);
+  float rh2 = 323.636*(25.48617*pow(H2PPM, -0.75161));
   float rs    = MQ7_RL_OHMS * (MQ7_SUPPLY_VOLTS - actualAOVoltage) / actualAOVoltage;
-  float ratio = rs / MQ7_R0_OHMS;
-  float coPPM = 99.042f * powf(ratio, -1.518f);
+
+  float rco = pow((1/rs)-(1/rh2)+(1/323.636),-1);
+  float coPPM = 20.20766*pow(rco/323.636,-0.652758);
 
   if (!isfinite(coPPM) || coPPM < 0.0f) {
     rawData.coPPM.valid = false;
@@ -206,6 +213,9 @@ static bool readSGP30() {
     rawData.tvocPPB.valid = false;
     return false;
   }
+
+  sgp.IAQmeasureRaw();
+  sout = sgp.rawH2;
 
   unsigned long now = millis();
   float eco2Val = static_cast<float>(sgp.eCO2);
@@ -346,6 +356,7 @@ void initializeSensors() {
     Serial.println("WARNING: SGP30 sensor not found on I2C!");
     faultDetections(SENSOR, false);
   }
+  sgp.setIAQBaseline(eCO2_base, TVOC_base);
 
   Serial2.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
 }
