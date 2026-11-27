@@ -58,7 +58,7 @@ static unsigned long lastSGP30Read   = 0;
 static unsigned long lastTempHumRead = 0;
 
 static uint16_t eCO2_base = 40332;
-static uint16_t TVOC_base = 43346;
+static uint16_t TVOC_base;
 static uint16_t sout = 0;
 
 // ============================================================
@@ -356,6 +356,8 @@ void initializeSensors() {
     Serial.println("WARNING: SGP30 sensor not found on I2C!");
     faultDetections(SENSOR, false);
   }
+  sgp.getIAQBaseline(&eCO2_base, &TVOC_base);
+  eCO2_base = 40332;
   sgp.setIAQBaseline(eCO2_base, TVOC_base);
 
   Serial2.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);

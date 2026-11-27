@@ -30,25 +30,19 @@ Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
  *   Storage & Diagnostics:
  *     d - Dump the entire active LittleFS CSV log file
  *     r - Reset/wipe both CSV log files and NVS upload bookmark back to File 1
- *     s - Print storage file size, unsent bytes, Wi-Fi, and NTP sync status
+ *     s - Print entry counts, file size, Wi-Fi, and NTP sync status
  *     p - Print the latest logged window averages, alert status, and fault counts
  *     f - Inject a simulated Storage fault
  *     c - Clear all active fault flags/counters and reset any active danger alert
- *   Verification & Simulation Tests (RTM R1, R3, R4, R6, R7, R8):
- *     1 - Inject valid mock readings for all 6 sensors to LCD & loggedData
- *     2 - Inject invalid readings (NaN CO, negative PM2.5) + INVALID fault
- *     3 - Toggle simulated emergency Danger Alert (flashing screen + buzzer)
- *     4 - Toggle forced Wi-Fi disconnect / reconnect (offline buffering test)
- *     5 - Toggle 60-second uptime/storage heartbeat log for endurance testing
  * Set ENABLE_VERIFICATION_TESTS to 0 when done
  */
 
-#define ENABLE_VERIFICATION_TESTS 0
+#define ENABLE_VERIFICATION_TESTS 1
 
 // Wi-Fi & Firebase Realtime Database credentials
 const char* WIFI_SSID           = "jacob";
 const char* WIFI_PASSWORD       = "341145100";
-const char* FIREBASE_URL        = "https://gas-monitor-6e3eb-default-rtdb.firebaseio.com/devices/testmonitor/readings.json";
+const char* FIREBASE_URL        = "https://gas-monitor-6e3eb-default-rtdb.firebaseio.com/devices/demomonitor/readings.json";
 const char* FIREBASE_AUTH_TOKEN = "1YfvkBGVE4v2KK5FFd7N1QkqjXl5opGkmFKVwLUd";
 
 // Pin assignments (single source of truth for all modules)
@@ -76,7 +70,8 @@ extern const int BUZZER_PIN         = 25; // Passive Buzzer    -> GPIO 25 (LEDC 
 // System intervals (ms)
 const unsigned long ALERT_CHECK_INTERVAL     = 1000UL;   // 1s fast danger check (RTM R3 <= 2s response)
 const unsigned long DISPLAY_INTERVAL         = 5000UL;   // 5s LCD & Wi-Fi refresh window
-const unsigned long LOG_INTERVAL             = 15000UL; // 5-minute CSV log & Firebase window
+const unsigned long LOG_INTERVAL             = 15000UL;  // CSV log & Firebase window
+const unsigned long LOG_START_DELAY_MS       = 150000UL; // Wait 2.5 minutes after boot before saving CSV entries
 extern const unsigned long TRANSMIT_INTERVAL = 2000UL;   // 2s background Firebase upload check
 
 // Air quality thresholds (CO and eCO2 only; -1.0f = unconfigured placeholder)
@@ -263,11 +258,17 @@ void loop() {
     renderDisplay(displayData);
   }
 
-  // --- Section 3 & 5: 5-minute Window Processing & LittleFS CSV Logging ---
+  // --- Section 3 & 5: Window Processing & LittleFS CSV Logging (after 2.5-min boot delay) ---
   if (currentTime - lastWindowClose >= LOG_INTERVAL) {
     lastWindowClose = currentTime;
     finalizeWindow(accumulators, loggedData);
-    storeData(loggedData);
+    static bool loggingEnabled = false;
+    if (!loggingEnabled && currentTime >= LOG_START_DELAY_MS) {
+      loggingEnabled = true;
+    }
+    if (loggingEnabled) {
+      storeData(loggedData);
+    }
   }
 
   // --- Section 4 & 6: Continuous Buzzer, Joystick/Alert UI & Core 0 Firebase Sync ---
