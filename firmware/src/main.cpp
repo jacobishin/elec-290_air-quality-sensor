@@ -43,7 +43,7 @@ Passive Buzzer - Audio alert (GPIO 25, LEDC Ch 4)
  * Set ENABLE_VERIFICATION_TESTS to 0 when done
  */
 
-#define ENABLE_VERIFICATION_TESTS 1
+#define ENABLE_VERIFICATION_TESTS 0
 
 // Wi-Fi & Firebase Realtime Database credentials
 const char* WIFI_SSID           = "jacob";
